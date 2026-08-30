@@ -106,7 +106,9 @@ def build_feature_table(
         SELECT
             cp.customer_idx, cp.article_id,
             cp.from_repeat, cp.from_trend, cp.from_category_color, cp.from_cf, cp.from_cooccurrence,
-            (cp.from_repeat + cp.from_trend + cp.from_category_color + cp.from_cf + cp.from_cooccurrence) AS n_sources,
+            cp.from_content_similarity,
+            (cp.from_repeat + cp.from_trend + cp.from_category_color + cp.from_cf + cp.from_cooccurrence
+             + cp.from_content_similarity) AS n_sources,
 
             a.product_code, a.product_group_name, a.index_group_name, a.section_name,
 

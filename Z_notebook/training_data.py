@@ -22,7 +22,7 @@ from common import FEATURES_DIR
 
 CAT_COLS = ["product_group_name", "index_group_name", "section_name"]
 INT8_COLS = ["from_repeat", "from_trend", "from_category_color", "from_cf", "from_cooccurrence",
-             "n_sources", "label"]
+             "from_content_similarity", "n_sources", "label"]
 INT32_COLS = ["customer_idx", "article_id", "u_total_purchases", "u_distinct_articles",
               "u_distinct_product_codes", "u_active_weeks", "i_total_sales",
               "i_days_since_last_sale", "i_sales_7d", "i_sales_28d", "ui_times_bought",

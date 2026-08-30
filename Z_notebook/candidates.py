@@ -1,4 +1,4 @@
-"""候補生成ロジック(自己リピート/トレンド人気/同カテゴリ同色/協調フィルタリング)。
+"""候補生成ロジック(自己リピート/トレンド人気/同カテゴリ同色/協調フィルタリング/アイテム共起/テキストコンテンツ類似)。
 
 03_candidate_generation.ipynb でソースごとのRecall@12/MAP@12を検証済み(参照: 00_md/hypothesis_driven_design.md)。
 04以降のノートブックはこのモジュールを共有して使う。
@@ -317,7 +317,7 @@ def build_cf_candidates(
 
 
 def build_candidate_pool(con, cutoff: str, target_customers, k_per_source: int = 12) -> pd.DataFrame:
-    """5ソースを統合し、(customer_idx, article_id)ごとにどのソース由来かのフラグを持つDataFrameを返す。"""
+    """6ソースを統合し、(customer_idx, article_id)ごとにどのソース由来かのフラグを持つDataFrameを返す。"""
     target_customers = list({int(c) for c in target_customers})
 
     repeat_map = build_repeat_candidates(con, cutoff, target_customers=target_customers, k=k_per_source)
@@ -325,6 +325,9 @@ def build_candidate_pool(con, cutoff: str, target_customers, k_per_source: int =
     category_map = build_category_color_candidates(con, cutoff, target_customers=target_customers, k=k_per_source)
     cf_map = build_cf_candidates(con, cutoff, target_customers, k_per_source)
     cooc_map = build_cooccurrence_candidates(con, cutoff, target_customers, k_per_source, seed_map=repeat_map)
+    content_map = build_content_similarity_candidates(
+        con, cutoff, target_customers, k=k_per_source, seed_map=repeat_map
+    )
 
     rows = {}
     for cid in target_customers:
@@ -334,6 +337,7 @@ def build_candidate_pool(con, cutoff: str, target_customers, k_per_source: int =
             "from_category_color": category_map.get(cid, []),
             "from_cf": cf_map.get(cid, []),
             "from_cooccurrence": cooc_map.get(cid, []),
+            "from_content_similarity": content_map.get(cid, []),
         }
         for src_name, articles in sources.items():
             for article_id in articles:
@@ -347,6 +351,7 @@ def build_candidate_pool(con, cutoff: str, target_customers, k_per_source: int =
                         "from_category_color": 0,
                         "from_cf": 0,
                         "from_cooccurrence": 0,
+                        "from_content_similarity": 0,
                     }
                 rows[key][src_name] = 1
 
