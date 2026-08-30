@@ -21,3 +21,6 @@ __pycache__/
 
 # Kaggle認証情報(誤コミット防止)
 kaggle.json
+
+# 一時バックアップ
+Z_notebook.zip

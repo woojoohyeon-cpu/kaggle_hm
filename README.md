@@ -9,7 +9,7 @@
   - `models/` — 学習済みモデル(pkl等)
   - `features/` — 特徴量エンジニアリングの中間生成物
   - `logs/` — 学習ログ
-- `Z_notebook/` — 役割ごとに1ファイルのNotebook(`01_eda.ipynb`, `02_feature_engineering.ipynb`, `03_train_lgbm.ipynb` ...)
+- `Z_notebook/` — 役割ごとに1ファイルのNotebook(`01_eda.ipynb`, `02_baseline.ipynb`, `03_candidate_generation.ipynb`, `04_feature_engineering.ipynb`, `05_train_lgbm.ipynb` ...)。`common.py`は共通ユーティリティ
 - `experiment_log.csv` — 実験記録(日時・特徴量・パラメータ・CV・Public LB・メモ)
 - `.gitignore` — データ・モデル・提出物など大容量ファイルをGit管理外に
 
