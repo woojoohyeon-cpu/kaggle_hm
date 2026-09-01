@@ -122,8 +122,11 @@ def build_feature_table(
             COALESCE(uf.u_active_weeks, 0) AS u_active_weeks,
             uf.u_menswear_share, uf.u_babychildren_share, uf.u_ladieswear_share,
 
-            itf.i_total_sales, itf.i_avg_price, itf.i_days_since_last_sale,
-            itf.i_sales_7d, itf.i_sales_28d,
+            COALESCE(itf.i_total_sales, 0) AS i_total_sales,
+            itf.i_avg_price,
+            COALESCE(itf.i_days_since_last_sale, 9999) AS i_days_since_last_sale,
+            COALESCE(itf.i_sales_7d, 0) AS i_sales_7d,
+            COALESCE(itf.i_sales_28d, 0) AS i_sales_28d,
 
             COALESCE(uif.ui_times_bought, 0) AS ui_times_bought,
             uif.ui_days_since_last_bought,

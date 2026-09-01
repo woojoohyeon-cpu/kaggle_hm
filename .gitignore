@@ -16,6 +16,9 @@ __pycache__/
 .venv/
 .env
 
+# DuckDBのスピル用一時ディレクトリ(メモリ制限超過時に自動生成)
+Z_notebook/.tmp/
+
 # OS
 .DS_Store
 
