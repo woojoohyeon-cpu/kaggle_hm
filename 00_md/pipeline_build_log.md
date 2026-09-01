@@ -227,6 +227,16 @@ backtest MAP@12こそ0.0344に改善したが、実際のLBはPublic 0.02571 / P
 (`run_20260901_1232_ranker_optuna`)。単一val週(直近7日)へのoptuna過適合と見られる。
 再挑戦する場合は複数week分のvalで評価するなど、単一週依存を減らす工夫を検討すること。
 
+### 候補ソースG(from_price_band)も不採用
+
+顧客の平均価格帯±標準偏差(H5)に収まる直近人気商品を候補にする`build_price_band_popularity_candidates`
+(`candidates.py`)を追加し7ソース化した。単体Recall@12=0.0217/MAP@12=0.0076でD/E/Fより良く、
+パイプライン全体でもbacktest MAP@12は0.0338→0.0343に改善(`run_20260901_1508_ranker`)。
+しかし実際のLBはPublic 0.02624→0.02585, Private 0.02618→0.02608と悪化し、
+optunaの時と同様に単一val週には合うが実際の翌週テストには合わない傾向が見られた。
+関数自体はcandidates.py/features.py/training_data.pyに残しているが、
+`build_candidate_pool`からは呼ばない(6ソースに戻す)。
+
 ### 06のモデル選択について(重要)
 
 以前は `06_predict_submit.ipynb` の `ranker_path = sorted(glob.glob(...))[-1]` で

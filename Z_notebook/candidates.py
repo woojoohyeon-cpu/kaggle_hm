@@ -103,6 +103,56 @@ def build_popularity_candidates(con, cutoff: str, window_days: int = 7, top_n: i
     return df.article_id.tolist()
 
 
+def build_price_band_popularity_candidates(
+    con,
+    cutoff: str,
+    target_customers=None,
+    k: int = 12,
+    window_days: int = 7,
+    pool_size: int = 300,
+    band_width: float = 0.3,
+) -> dict:
+    """価格帯フィルタ人気候補(H5): 顧客ごとの平均購入価格帯に収まる直近人気商品を優先する。
+
+    顧客の価格CVが母集団より小さい(H5)前提のもと、直近window_days日間の人気上位pool_size件を
+    候補プールとして、顧客の平均価格±max(価格の標準偏差, 平均価格*band_width)の範囲に入るものだけを
+    人気順に残す(購入1回のみでstd_priceがNULLの顧客はband_width側のフォールバック幅を使う)。
+    """
+    filter_clause = _register_target_customers(con, target_customers)
+    df = con.execute(f"""
+        WITH cust_price AS (
+            SELECT customer_idx, AVG(price) AS avg_price, STDDEV(price) AS std_price
+            FROM trans
+            WHERE t_dat <= DATE '{cutoff}' {filter_clause}
+            GROUP BY customer_idx
+        ),
+        recent_pop AS (
+            SELECT article_id, COUNT(*) AS cnt, AVG(price) AS item_avg_price
+            FROM trans
+            WHERE t_dat <= DATE '{cutoff}' AND t_dat > DATE '{cutoff}' - INTERVAL {window_days} DAY
+            GROUP BY article_id
+            ORDER BY cnt DESC
+            LIMIT {pool_size}
+        ),
+        banded AS (
+            SELECT c.customer_idx, r.article_id, r.cnt,
+                   ROW_NUMBER() OVER (PARTITION BY c.customer_idx ORDER BY r.cnt DESC) AS rn
+            FROM cust_price c
+            JOIN recent_pop r
+                ON r.item_avg_price BETWEEN
+                   c.avg_price - GREATEST(COALESCE(c.std_price, 0), c.avg_price * {band_width})
+                   AND c.avg_price + GREATEST(COALESCE(c.std_price, 0), c.avg_price * {band_width})
+        )
+        SELECT customer_idx, LIST(article_id ORDER BY rn) AS candidates
+        FROM banded
+        WHERE rn <= {k}
+        GROUP BY customer_idx
+    """).df()
+    if target_customers is not None:
+        con.unregister("_target_customers_tbl")
+    return dict(zip(df.customer_idx, df.candidates))
+
+
 def build_category_color_candidates(con, cutoff: str, target_customers=None, k: int = 12) -> dict:
     """同カテゴリ/同色候補: product_code色違い(H1)優先、不足分は最頻section_nameの人気商品(H2c)で補完。
 
@@ -317,7 +367,11 @@ def build_cf_candidates(
 
 
 def build_candidate_pool(con, cutoff: str, target_customers, k_per_source: int = 12) -> pd.DataFrame:
-    """6ソースを統合し、(customer_idx, article_id)ごとにどのソース由来かのフラグを持つDataFrameを返す。"""
+    """6ソースを統合し、(customer_idx, article_id)ごとにどのソース由来かのフラグを持つDataFrameを返す。
+
+    候補ソースG(build_price_band_popularity_candidates, H5価格帯フィルタ人気)はbacktestは改善したが
+    実LB(Public/Private)が悪化したため不採用(00_md/pipeline_build_log.md参照)。関数自体は残す。
+    """
     target_customers = list({int(c) for c in target_customers})
 
     repeat_map = build_repeat_candidates(con, cutoff, target_customers=target_customers, k=k_per_source)
