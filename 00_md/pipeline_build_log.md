@@ -210,23 +210,31 @@ COVID期(2020年3〜4月)のレジームシフトは含まれない。
 
 ---
 
-## 5. 現在の最良モデル(2026-08-14時点)
+## 5. 現在の最良モデル(2026-09-01時点)
 
-- モデル: `02_output/models/model_20260814_0833_ranker.pkl`(LGBMRanker, optunaベストパラメータ、
+- モデル: `02_output/models/model_20260901_0953_ranker.pkl`(LGBMRanker, デフォルトパラメータ、
   `{"model":..., "feature_cols":..., "cat_cols":...}` の辞書)
-- 学習データ: `02_output/features/train_features_20260813_1747.parquet`
-  (候補5ソース×学習4週、負例サンプリング前80,143,335行→サンプリング後14,211,031行)
-  / `val_features_20260813_1747.parquet`(候補5ソース×検証1週、19,649,303行)
-- バックテストMAP@12: 0.0336 / Public LB: 0.02570 / Private LB: 0.02572
-- 最新提出ファイル: `02_output/submission/submission_20260814_0855_cv0.0336.csv`
-- optunaベストパラメータ: `num_leaves=97, learning_rate≈0.043, min_child_samples=101,
-  feature_fraction≈0.67, bagging_fraction≈0.84, bagging_freq=3, lambda_l1≈0.00015, lambda_l2≈0.023`
-  (n_estimators=500 + early_stopping=30 で本番学習。詳細は `experiment_log.csv` の
-  `run_20260814_0833_ranker_optuna` 行)
+- 学習データ: `02_output/features/train_features_20260831_2226.parquet`
+  (候補6ソース[from_content_similarity含む]×学習4週) / `val_features_20260831_2226.parquet`
+- バックテストMAP@12: 0.0338 / Public LB: 0.02624 / Private LB: 0.02618
+- 最新提出ファイル: `02_output/submission/submission_20260901_1019_cv0.0338.csv`
+- 詳細は `experiment_log.csv` の `run_20260901_0953_ranker` 行
 
-06から次の提出を作るときは、`06_predict_submit.ipynb` の `ranker_path = sorted(glob.glob(...))[-1]` が
-自動で最新モデルを拾うので、基本的にそのまま再実行すればよい
-(`BACKTEST_MAP12` 定数だけは手で更新すること)。
+### optunaは現時点では不採用
+
+`07_optuna_tune.ipynb`(20試行、単一val週での探索)で得たパラメータは
+backtest MAP@12こそ0.0344に改善したが、実際のLBはPublic 0.02571 / Private 0.02611と悪化した
+(`run_20260901_1232_ranker_optuna`)。単一val週(直近7日)へのoptuna過適合と見られる。
+再挑戦する場合は複数week分のvalで評価するなど、単一週依存を減らす工夫を検討すること。
+
+### 06のモデル選択について(重要)
+
+以前は `06_predict_submit.ipynb` の `ranker_path = sorted(glob.glob(...))[-1]` で
+最新モデルファイルを自動選択していたが、上記のoptuna過適合の件で
+「最新 = 最良」が成り立たないことが判明したため、**`ranker_path` は現在ベストモデルへの
+固定パス(ハードコード)に変更済み**(`06_predict_submit.ipynb` 内にコメントで理由を明記)。
+新しいrunが `experiment_log.csv` 上でこのベストを明確に上回ったことを確認してから、
+手動で `ranker_path` と `BACKTEST_MAP12` を更新すること。
 
 ---
 
