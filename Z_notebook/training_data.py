@@ -16,6 +16,7 @@ import glob
 import os
 
 import pandas as pd
+import pyarrow as pa
 import pyarrow.parquet as pq
 
 from common import FEATURES_DIR
@@ -24,13 +25,15 @@ CAT_COLS = ["product_group_name", "index_group_name", "section_name"]
 INT8_COLS = ["from_repeat", "from_trend", "from_category_color", "from_cf", "from_cooccurrence",
              "from_content_similarity", "n_sources", "label"]
 INT32_COLS = ["customer_idx", "article_id", "u_total_purchases", "u_distinct_articles",
-              "u_distinct_product_codes", "u_active_weeks", "i_total_sales",
-              "i_days_since_last_sale", "i_sales_7d", "i_sales_28d", "ui_times_bought",
-              "ui_times_bought_product_code", "target_week_start_dom"]
+              "u_distinct_product_codes", "u_active_weeks", "u_purchases_7d", "u_purchases_28d",
+              "u_purchases_91d", "i_total_sales",
+              "i_days_since_last_sale", "i_sales_7d", "i_sales_28d", "i_sales_yoy_7d",
+              "cat_sales_yoy_7d", "cat_sales_recent_28d",
+              "ui_times_bought", "ui_times_bought_product_code", "target_week_start_dom"]
 FLOAT32_COLS = ["u_avg_price", "u_price_cv", "u_online_ratio", "u_menswear_share",
                  "u_babychildren_share", "u_ladieswear_share", "i_avg_price", "ui_price_diff",
                  "u_days_since_last_purchase", "ui_days_since_last_bought",
-                 "ui_days_since_last_bought_product_code"]
+                 "ui_days_since_last_bought_product_code", "cat_seasonal_lift"]
 EXCLUDE_COLS = ["customer_idx", "article_id", "label", "cutoff"]
 
 
@@ -41,22 +44,36 @@ def latest_feature_paths():
 
 
 def _downcast(df: pd.DataFrame) -> pd.DataFrame:
-    present_int8 = [c for c in INT8_COLS if c in df.columns]
-    present_int32 = [c for c in INT32_COLS if c in df.columns]
-    present_float32 = [c for c in FLOAT32_COLS if c in df.columns]
-    for c in present_int8:
-        df[c] = df[c].astype("int8")
-    for c in present_int32:
-        df[c] = df[c].astype("int32")
-    for c in present_float32:
-        df[c] = df[c].astype("float32")
     df["cutoff"] = df["cutoff"].astype("category")
     return df
 
 
+_ARROW_DOWNCAST = {}
+for _c in INT8_COLS:
+    _ARROW_DOWNCAST[_c] = pa.int8()
+for _c in INT32_COLS:
+    _ARROW_DOWNCAST[_c] = pa.int32()
+for _c in FLOAT32_COLS:
+    _ARROW_DOWNCAST[_c] = pa.float32()
+
+
 def _load_one(path: str) -> pd.DataFrame:
+    """pandasに変換する前にArrow側で数値列を狭い型にcastしてから読み込む。
+
+    pyarrowのtable→pandas変換は、変換前のArrow型(parquetに書き出された生のint64/float64)の
+    ままメモリに展開されてから初めてpandas側でdowncastできる。列数が増えるほどこの変換直前の
+    ピークメモリが線形に増え、80M行超のtrain_featuresでOOM killされることを確認済み
+    (00_md/pipeline_build_log.md 6節)。Arrow Tableの段階でint8/int32/float32にcastしてから
+    to_pandas()する(=変換前から既に狭い型)ことで、このピークをpandas側dowcastより大きく削減する。
+    """
     load_columns = [c for c in pq.ParquetFile(path).schema.names if c != "product_code"]
-    df = pq.read_table(path, columns=load_columns).to_pandas(categories=CAT_COLS)
+    table = pq.read_table(path, columns=load_columns)
+    for name, arrow_type in _ARROW_DOWNCAST.items():
+        if name in table.column_names:
+            idx = table.column_names.index(name)
+            table = table.set_column(idx, name, table.column(name).cast(arrow_type))
+    df = table.to_pandas(categories=CAT_COLS)
+    del table
     return _downcast(df)
 
 

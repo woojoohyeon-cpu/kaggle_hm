@@ -366,21 +366,56 @@ def build_cf_candidates(
     }
 
 
-def build_candidate_pool(con, cutoff: str, target_customers, k_per_source: int = 12) -> pd.DataFrame:
+DEFAULT_K_PER_SOURCE = {
+    "from_repeat": 20,
+    "from_trend": 20,
+    "from_category_color": 12,
+    "from_cf": 12,
+    "from_cooccurrence": 12,
+    "from_content_similarity": 12,
+}
+
+
+def build_candidate_pool(con, cutoff: str, target_customers, k_per_source=None, seed_k: int = 12) -> pd.DataFrame:
     """6ソースを統合し、(customer_idx, article_id)ごとにどのソース由来かのフラグを持つDataFrameを返す。
 
     候補ソースG(build_price_band_popularity_candidates, H5価格帯フィルタ人気)はbacktestは改善したが
     実LB(Public/Private)が悪化したため不採用(00_md/pipeline_build_log.md参照)。関数自体は残す。
+
+    k_per_source: ソースごとの取得件数。Noneなら DEFAULT_K_PER_SOURCE を使う
+    (03の単体Recall@12が高かったA:自己リピート/B:トレンド人気を20件に拡張、他は12件のまま)。
+    intを渡すと全ソース一律その件数になる(従来の挙動、後方互換用)。dictを渡すと
+    一部のソースだけ上書きできる(未指定キーはDEFAULT_K_PER_SOURCEを使う)。
+    seed_k: アイテム共起(E)・テキスト類似(F)のシードに使う自己リピート候補の件数。
+    from_repeatの出力件数を広げてもシードの質は12件のまま据え置きたい場合などに、
+    k_per_source["from_repeat"]とは独立に指定できる。
     """
+    if k_per_source is None:
+        k_map = dict(DEFAULT_K_PER_SOURCE)
+    elif isinstance(k_per_source, int):
+        k_map = {name: k_per_source for name in DEFAULT_K_PER_SOURCE}
+    else:
+        k_map = {**DEFAULT_K_PER_SOURCE, **k_per_source}
+
     target_customers = list({int(c) for c in target_customers})
 
-    repeat_map = build_repeat_candidates(con, cutoff, target_customers=target_customers, k=k_per_source)
-    pop_list = build_popularity_candidates(con, cutoff, top_n=k_per_source)
-    category_map = build_category_color_candidates(con, cutoff, target_customers=target_customers, k=k_per_source)
-    cf_map = build_cf_candidates(con, cutoff, target_customers, k_per_source)
-    cooc_map = build_cooccurrence_candidates(con, cutoff, target_customers, k_per_source, seed_map=repeat_map)
+    repeat_map = build_repeat_candidates(con, cutoff, target_customers=target_customers, k=k_map["from_repeat"])
+    pop_list = build_popularity_candidates(con, cutoff, top_n=k_map["from_trend"])
+    category_map = build_category_color_candidates(
+        con, cutoff, target_customers=target_customers, k=k_map["from_category_color"]
+    )
+    cf_map = build_cf_candidates(con, cutoff, target_customers, k_map["from_cf"])
+
+    if seed_k == k_map["from_repeat"]:
+        seed_map = repeat_map
+    else:
+        seed_map = build_repeat_candidates(con, cutoff, target_customers=target_customers, k=seed_k)
+
+    cooc_map = build_cooccurrence_candidates(
+        con, cutoff, target_customers, k_map["from_cooccurrence"], seed_map=seed_map
+    )
     content_map = build_content_similarity_candidates(
-        con, cutoff, target_customers, k=k_per_source, seed_map=repeat_map
+        con, cutoff, target_customers, k=k_map["from_content_similarity"], seed_map=seed_map
     )
 
     rows = {}
