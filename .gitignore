@@ -4,6 +4,7 @@
 02_output/models/*
 02_output/features/*
 02_output/logs/*.log
+02_output/experiments/
 !02_output/submission/.gitkeep
 !02_output/models/.gitkeep
 !02_output/features/.gitkeep

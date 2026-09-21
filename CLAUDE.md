@@ -17,10 +17,12 @@ Kaggle「H&M Personalized Fashion Recommendations」コンペのリポジトリ�
   - `submission/` — 提出用csv
   - `models/` — 学習済みモデル(pickle、`{"model":..., "feature_cols":..., "cat_cols":...}`の辞書形式)
   - `features/` — 特徴量エンジニアリングの中間生成物(`trans_lite.parquet`, `train/val_features_*.parquet`, `content_similarity.parquet`)
+  - `experiments/` — `run_trend_experiment.py` の作業ディレクトリ(週ごとの特徴量・モデル・結果・レポート)
   - `logs/` — 学習ログ
-- `Z_notebook/` — 役割ごとに1ファイルのNotebook: `01_eda.ipynb` → `02_baseline.ipynb` → `03_candidate_generation.ipynb` → `04_feature_engineering.ipynb` → `05_train_lgbm.ipynb` → `06_predict_submit.ipynb` → `07_optuna_tune.ipynb`(以降追加時も連番を継続)。
-  共有モジュール: `common.py`(duckdb接続・バックテスト分割・MAP@12/Recall@12・提出フォーマット・実験ログ追記・共通パス定数)、`candidates.py`(6候補ソースの生成ロジック、target_customersで絞り込み可能)、`features.py`(候補×特徴量×ラベルのテーブル構築)、`training_data.py`(大規模train/valのOOM対策込みロード)。
-  CLIスクリプト(サブプロセスとして呼ぶ想定): `build_one_cutoff.py`(1cutoff分の特徴量構築)、`build_content_similarity.py`(商品テキストのTF-IDF類似度事前計算)
+- `Z_notebook/` — 役割ごとに1ファイルのNotebook: `01_eda.ipynb` → `02_baseline.ipynb` → `03_candidate_generation.ipynb` → `04_feature_engineering.ipynb` → `05_train_lgbm.ipynb` → `06_predict_submit.ipynb` → `07_optuna_tune.ipynb` → `08_multi_week_backtest.ipynb` → `09_trend_hypothesis.ipynb`(短期トレンド仮説の検証、Colab/ローカル両対応)(以降追加時も連番を継続)。
+  共有モジュール: `common.py`(duckdb接続・バックテスト分割・MAP@12/Recall@12・提出フォーマット・実験ログ追記・共通パス定数・`ensure_trans_lite`)、`candidates.py`(6候補ソース+任意の年齢層別トレンド候補の生成ロジック、target_customersで絞り込み可能)、`features.py`(候補×特徴量×ラベルのテーブル構築。特徴量セット`BASE_0906_FEATURES`/`TREND_FEATURES`/`YOY_FEATURES`)、`training_data.py`(大規模train/valのOOM対策込みロード)、`multi_week_eval.py`(既存モデルの複数週再評価)、`train_protocol.py`(独立評価を守った学習・評価・ブートストラップ)。
+  CLIスクリプト(サブプロセスとして呼ぶ想定): `build_one_cutoff.py`(1cutoff分の特徴量構築、parquetへ直接書き出し)、`build_content_similarity.py`(商品テキストのTF-IDF類似度事前計算)、`run_trend_experiment.py`(09の本体: build/train/report/refit/predict)
+  duckdbのメモリ上限等は環境変数 `HM_DUCKDB_MEMORY`(既定12GB)/`HM_DUCKDB_THREADS`/`HM_DUCKDB_TMP` で切り替える(Colab High-RAMなら20GB)。
 - `experiment_log.csv` — 実験記録
 
 ## バージョン管理・成果物の運用ルール

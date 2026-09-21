@@ -16,13 +16,27 @@ import pickle
 import pandas as pd
 
 from common import label_window
-from features import build_feature_table
+from features import TREND_FEATURES, YOY_FEATURES, build_feature_table
 
 NULLABLE_INT_COLS = [
     "u_days_since_last_purchase",
     "ui_days_since_last_bought",
     "ui_days_since_last_bought_product_code",
 ]
+
+
+def _table_options(feature_col_lists) -> dict:
+    """評価対象モデルが使う列から、特徴量テーブルに必要なオプションを決める。
+
+    features.pyは2026-09-21以降、YoY(0917版)・短期トレンド列・年齢層別トレンド候補を既定では作らないため、
+    それらを使うモデルを採点するときだけ自動で有効化する(08で0917版を再評価しても列不足にならないように)。
+    """
+    cols = set().union(*[set(c) for c in feature_col_lists])
+    return {
+        "include_yoy": bool(cols & set(YOY_FEATURES)),
+        "include_trend": bool(cols & set(TREND_FEATURES)),
+        "extra_sources": ("age_trend",) if "from_age_trend" in cols else (),
+    }
 
 
 def holdout_cutoffs(con, n_weeks: int = 4, min_gap_days: int = 42, step_days: int = 7) -> list:
@@ -71,7 +85,7 @@ def score_model_at_cutoff(
 
     df = build_feature_table(
         con, cutoff, label_days=label_days, trailing_days=trailing_days,
-        k_per_source=k_per_source, with_label=True,
+        k_per_source=k_per_source, with_label=True, **_table_options([feature_cols]),
     )
     actual_map = label_window(con, cutoff, label_days)
 
@@ -138,6 +152,7 @@ def group_score_at_cutoff(
     df = build_feature_table(
         con, cutoff, label_days=label_days, trailing_days=trailing_days,
         k_per_source=k_per_source, with_label=True,
+        **_table_options([payload["feature_cols"] for _, payload, _ in models]),
     )
     actual_map = label_window(con, cutoff, label_days)
 

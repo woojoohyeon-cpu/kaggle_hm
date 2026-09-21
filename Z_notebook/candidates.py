@@ -1,15 +1,67 @@
-"""候補生成ロジック(自己リピート/トレンド人気/同カテゴリ同色/協調フィルタリング/アイテム共起/テキストコンテンツ類似)。
+"""候補生成ロジック。
+
+既定の6ソース: A自己リピート / Bトレンド人気(全体) / C同カテゴリ同色 / D協調フィルタリング(ALS) /
+Eアイテム共起 / Fテキストコンテンツ類似。
+追加ソース(extra_sourcesで明示的に有効化した時のみ): H年齢層別トレンド人気(`age_trend`)。
 
 03_candidate_generation.ipynb でソースごとのRecall@12/MAP@12を検証済み(参照: 00_md/hypothesis_driven_design.md)。
-04以降のノートブックはこのモジュールを共有して使う。
+04以降のノートブック・CLIはこのモジュールを共有して使う。
+
+候補プールの統合(`build_candidate_pool_table`)は、(customer_idx, article_id, source)の縦持ち配列を作ってから
+duckdbでGROUP BYしてフラグ列に展開する。以前の「(cid, aid)をキーにしたPython辞書の辞書」方式は
+3,000万ペア規模でPythonオブジェクトだけで十数GBを消費し、Colab(スワップなし)でOOM killされる主因だった
+(00_md/pipeline_build_log.md「短期トレンド仮説での再設計」節参照)。出力の中身(ペア集合とフラグ)は同一。
 """
 
+import itertools
 import os
 
 import numpy as np
 import pandas as pd
 import implicit
 from scipy.sparse import coo_matrix
+
+from common import DATA_DIR
+
+# 候補プールのフラグ列。順序はbuild_candidate_pool(旧実装)の列順と同じ。
+BASE_SOURCE_COLS = [
+    "from_repeat",
+    "from_trend",
+    "from_category_color",
+    "from_cf",
+    "from_cooccurrence",
+    "from_content_similarity",
+]
+EXTRA_SOURCE_COLS = {"age_trend": "from_age_trend"}
+
+# 年齢層の区切り。NULL(年齢不明)は-1として独立した層にする。
+AGE_BUCKET_EDGES = [20, 25, 30, 40, 50, 60]
+
+
+def age_bucket_sql(col: str) -> str:
+    """年齢列を年齢層番号(-1: 不明, 0: <20, 1: 20-24, ..., 6: 60+)に変換するSQL式。"""
+    cases = " ".join(f"WHEN {col} < {edge} THEN {i}" for i, edge in enumerate(AGE_BUCKET_EDGES))
+    return f"(CASE WHEN {col} IS NULL THEN -1 {cases} ELSE {len(AGE_BUCKET_EDGES)} END)"
+
+
+def ensure_cust_age(con) -> None:
+    """customer_idx -> (age, age_bucket) の対応表 cust_age をduckdbに作る(既にあれば何もしない)。
+
+    cust_mapはget_con()で作られている前提。trans_liteにもage列はあるが、期間内に購入のない顧客
+    (コールドスタート)の年齢も必要なため customers.csv から作る。
+    """
+    exists = con.execute(
+        "SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'cust_age'"
+    ).fetchone()[0]
+    if exists:
+        return
+    con.execute(f"""
+        CREATE TABLE cust_age AS
+        SELECT cm.customer_idx, c.age::SMALLINT AS age, {age_bucket_sql('c.age')}::TINYINT AS age_bucket
+        FROM cust_map cm
+        LEFT JOIN read_csv_auto('{DATA_DIR}/customers.csv') c USING (customer_id)
+    """)
+
 
 _CONTENT_SIM_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "..", "02_output", "features", "content_similarity.parquet"
@@ -48,7 +100,7 @@ def build_content_similarity_candidates(con, cutoff: str, target_customers, k: i
         for seed in seed_map.get(cid, []):
             for neighbor, sim in content_sim.get(int(seed), []):
                 scores[neighbor] = scores.get(neighbor, 0.0) + sim
-        top = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:k]
+        top = sorted(scores.items(), key=lambda x: (-x[1], x[0]))[:k]
         preds[cid] = [a for a, _ in top]
     return preds
 
@@ -77,7 +129,7 @@ def build_repeat_candidates(con, cutoff: str, target_customers=None, k: int = 12
         ),
         ranked AS (
             SELECT customer_idx, article_id,
-                   ROW_NUMBER() OVER (PARTITION BY customer_idx ORDER BY last_dat DESC, freq DESC) AS rn
+                   ROW_NUMBER() OVER (PARTITION BY customer_idx ORDER BY last_dat DESC, freq DESC, article_id) AS rn
             FROM agg
         )
         SELECT customer_idx, LIST(article_id ORDER BY rn) AS candidates
@@ -97,10 +149,61 @@ def build_popularity_candidates(con, cutoff: str, window_days: int = 7, top_n: i
         FROM trans
         WHERE t_dat <= DATE '{cutoff}' AND t_dat > DATE '{cutoff}' - INTERVAL {window_days} DAY
         GROUP BY article_id
-        ORDER BY cnt DESC
+        ORDER BY cnt DESC, article_id
         LIMIT {top_n}
     """).df()
     return df.article_id.tolist()
+
+
+def build_age_trend_table(con, cutoff: str, k: int = 12, window_days: int = 7, table_name: str = "_age_trend_top") -> str:
+    """年齢層別トレンド人気(H): cutoff直前window_days日間に、同じ年齢層の顧客に最も売れた上位k件。
+
+    短期トレンド仮説(ファストファッションは季節より「今この層で流行っているもの」が売れる)に基づく
+    候補ソース。全体トレンド(B)は全員に同じ12〜20件を出すが、こちらは年齢層ごとに異なる。
+    (age_bucket, article_id, rn) のテーブルを作ってテーブル名を返す。
+    """
+    con.execute(f"""
+        CREATE OR REPLACE TABLE {table_name} AS
+        SELECT age_bucket, article_id, rn
+        FROM (
+            SELECT age_bucket, article_id,
+                   ROW_NUMBER() OVER (PARTITION BY age_bucket ORDER BY cnt DESC, article_id) AS rn
+            FROM (
+                SELECT {age_bucket_sql('age')} AS age_bucket, article_id, COUNT(*) AS cnt
+                FROM trans
+                WHERE t_dat <= DATE '{cutoff}' AND t_dat > DATE '{cutoff}' - INTERVAL {window_days} DAY
+                GROUP BY 1, 2
+            )
+        )
+        WHERE rn <= {k}
+    """)
+    return table_name
+
+
+def build_age_trend_candidates(con, cutoff: str, target_customers, k: int = 12, window_days: int = 7) -> dict:
+    """年齢層別トレンド人気候補を {customer_idx: [article_id, ...]} で返す(03のような単体ソース検証用)。"""
+    ensure_cust_age(con)
+    table = build_age_trend_table(con, cutoff, k=k, window_days=window_days)
+    target_df = pd.DataFrame({"customer_idx": np.array(sorted({int(c) for c in target_customers}), dtype=np.int32)})
+    con.register("_age_targets", target_df)
+    df = con.execute(f"""
+        SELECT t.customer_idx, LIST(a.article_id ORDER BY a.rn) AS candidates
+        FROM _age_targets t
+        JOIN cust_age ca USING (customer_idx)
+        JOIN {table} a ON a.age_bucket = ca.age_bucket
+        GROUP BY t.customer_idx
+    """).df()
+    con.unregister("_age_targets")
+    return dict(zip(df.customer_idx, df.candidates))
+
+
+def age_trend_lists(con, cutoff: str, k: int = 12, window_days: int = 7) -> dict:
+    """{age_bucket: [article_id, ...]}。提出時のコールドスタート顧客向けフォールバックに使う。"""
+    table = build_age_trend_table(con, cutoff, k=k, window_days=window_days)
+    df = con.execute(f"""
+        SELECT age_bucket, LIST(article_id ORDER BY rn) AS items FROM {table} GROUP BY age_bucket
+    """).df()
+    return {int(b): [int(a) for a in items] for b, items in zip(df.age_bucket, df["items"])}
 
 
 def build_price_band_popularity_candidates(
@@ -171,7 +274,7 @@ def build_category_color_candidates(con, cutoff: str, target_customers=None, k: 
         ),
         ranked AS (
             SELECT cp.customer_idx, vp.article_id,
-                   ROW_NUMBER() OVER (PARTITION BY cp.customer_idx ORDER BY vp.cnt DESC) AS rn
+                   ROW_NUMBER() OVER (PARTITION BY cp.customer_idx ORDER BY vp.cnt DESC, vp.article_id) AS rn
             FROM cust_products cp
             JOIN variant_pop vp USING (product_code)
         )
@@ -192,7 +295,7 @@ def build_category_color_candidates(con, cutoff: str, target_customers=None, k: 
         )
         SELECT customer_idx, section_name
         FROM (
-            SELECT *, ROW_NUMBER() OVER (PARTITION BY customer_idx ORDER BY cnt DESC) AS rn
+            SELECT *, ROW_NUMBER() OVER (PARTITION BY customer_idx ORDER BY cnt DESC, section_name) AS rn
             FROM sec_cnt
         )
         WHERE rn = 1
@@ -210,7 +313,7 @@ def build_category_color_candidates(con, cutoff: str, target_customers=None, k: 
             GROUP BY a.section_name, t.article_id
         ),
         ranked AS (
-            SELECT *, ROW_NUMBER() OVER (PARTITION BY section_name ORDER BY cnt DESC) AS rn
+            SELECT *, ROW_NUMBER() OVER (PARTITION BY section_name ORDER BY cnt DESC, article_id) AS rn
             FROM sec_item_cnt
         )
         SELECT section_name, LIST(article_id ORDER BY rn) AS item_list
@@ -263,7 +366,7 @@ def build_item_cooccurrence_table(con, cutoff: str, top_partners_per_item: int =
         CREATE OR REPLACE TABLE cooc_top AS
         SELECT article_a, article_b, cnt
         FROM (
-            SELECT *, ROW_NUMBER() OVER (PARTITION BY article_a ORDER BY cnt DESC) AS rn
+            SELECT *, ROW_NUMBER() OVER (PARTITION BY article_a ORDER BY cnt DESC, article_b) AS rn
             FROM cooc_raw
         )
         WHERE rn <= {top_partners_per_item}
@@ -304,7 +407,7 @@ def build_cooccurrence_candidates(
         ),
         ranked AS (
             SELECT customer_idx, article_id,
-                   ROW_NUMBER() OVER (PARTITION BY customer_idx ORDER BY score DESC) AS rn
+                   ROW_NUMBER() OVER (PARTITION BY customer_idx ORDER BY score DESC, article_id) AS rn
             FROM scored
         )
         SELECT customer_idx, LIST(article_id ORDER BY rn) AS candidates
@@ -334,7 +437,9 @@ def build_cf_candidates(
         GROUP BY customer_idx, article_id
     """).df()
 
-    item_ids = interactions["article_id"].unique()
+    # duckdbのGROUP BY結果は行順が実行ごとに変わるため、商品インデックスの採番を固定する
+    # (採番が変わるとALSの初期値の割り当てが変わり、同じrandom_stateでも結果が揺れる)
+    item_ids = np.sort(interactions["article_id"].unique())
     item_id_to_idx = {a: i for i, a in enumerate(item_ids)}
     idx_to_item_id = {i: a for a, i in item_id_to_idx.items()}
     interactions["item_idx"] = interactions["article_id"].map(item_id_to_idx)
@@ -348,8 +453,10 @@ def build_cf_candidates(
         shape=(n_users, n_items),
     ).tocsr()
 
+    # スレッド数は HM_ALS_THREADS で指定できる(既定0=全コア。商品インデックスを固定したのでスレッド数によらず再現する)
     model = implicit.als.AlternatingLeastSquares(
-        factors=factors, regularization=0.01, iterations=iterations, random_state=random_state
+        factors=factors, regularization=0.01, iterations=iterations, random_state=random_state,
+        num_threads=int(os.environ.get("HM_ALS_THREADS", 0)),
     )
     model.fit(user_items)
 
@@ -376,8 +483,143 @@ DEFAULT_K_PER_SOURCE = {
 }
 
 
-def build_candidate_pool(con, cutoff: str, target_customers, k_per_source=None, seed_k: int = 12) -> pd.DataFrame:
-    """6ソースを統合し、(customer_idx, article_id)ごとにどのソース由来かのフラグを持つDataFrameを返す。
+def _map_to_long(candidate_map: dict, src: int) -> pd.DataFrame:
+    """{customer_idx: [article_id, ...]} を (customer_idx, article_id, src) の縦持ちDataFrameにする。"""
+    if not candidate_map:
+        return pd.DataFrame({
+            "customer_idx": np.array([], dtype=np.int32),
+            "article_id": np.array([], dtype=np.int64),
+            "src": np.array([], dtype=np.int8),
+        })
+    n = len(candidate_map)
+    cids = np.fromiter(candidate_map.keys(), dtype=np.int64, count=n)
+    lens = np.fromiter((len(v) for v in candidate_map.values()), dtype=np.int64, count=n)
+    total = int(lens.sum())
+    arts = np.fromiter(itertools.chain.from_iterable(candidate_map.values()), dtype=np.int64, count=total)
+    return pd.DataFrame({
+        "customer_idx": np.repeat(cids, lens).astype(np.int32),
+        "article_id": arts,
+        "src": np.full(total, src, dtype=np.int8),
+    })
+
+
+def _resolve_k_map(k_per_source) -> dict:
+    if k_per_source is None:
+        return dict(DEFAULT_K_PER_SOURCE)
+    if isinstance(k_per_source, int):
+        return {name: k_per_source for name in DEFAULT_K_PER_SOURCE}
+    return {**DEFAULT_K_PER_SOURCE, **k_per_source}
+
+
+def build_candidate_pool_table(
+    con,
+    cutoff: str,
+    target_customers,
+    k_per_source=None,
+    seed_k: int = 12,
+    extra_sources=(),
+    table_name: str = "candidate_pool",
+    verbose: bool = False,
+) -> int:
+    """候補ソースを統合した (customer_idx, article_id, from_*フラグ...) のテーブルをduckdb内に作り、行数を返す。
+
+    k_per_source / seed_k の意味は build_candidate_pool と同じ。
+    extra_sources: 既定6ソースに加えて有効化する追加ソース名のタプル。現在は "age_trend" のみ
+        (列名 from_age_trend)。既定では空で、既存モデル(0906版など)と同じ6ソースのプールになる。
+    """
+    unknown = set(extra_sources) - set(EXTRA_SOURCE_COLS)
+    if unknown:
+        raise ValueError(f"未知の追加ソース: {unknown}")
+    k_map = _resolve_k_map(k_per_source)
+    src_cols = BASE_SOURCE_COLS + [EXTRA_SOURCE_COLS[s] for s in extra_sources]
+    src_code = {name: i for i, name in enumerate(src_cols)}
+
+    target_customers = sorted({int(c) for c in target_customers})
+
+    def log(msg):
+        if verbose:
+            print(f"  [{cutoff}] {msg}", flush=True)
+
+    parts = []
+    repeat_map = build_repeat_candidates(con, cutoff, target_customers=target_customers, k=k_map["from_repeat"])
+    log(f"A 自己リピート: {len(repeat_map):,}顧客")
+    pop_list = build_popularity_candidates(con, cutoff, top_n=k_map["from_trend"])
+
+    category_map = build_category_color_candidates(
+        con, cutoff, target_customers=target_customers, k=k_map["from_category_color"]
+    )
+    parts.append(_map_to_long(category_map, src_code["from_category_color"]))
+    del category_map
+    log("C 同カテゴリ/同色: done")
+
+    cf_map = build_cf_candidates(con, cutoff, target_customers, k_map["from_cf"])
+    parts.append(_map_to_long(cf_map, src_code["from_cf"]))
+    del cf_map
+    log("D CF(ALS): done")
+
+    if seed_k == k_map["from_repeat"]:
+        seed_map = repeat_map
+    else:
+        seed_map = build_repeat_candidates(con, cutoff, target_customers=target_customers, k=seed_k)
+
+    cooc_map = build_cooccurrence_candidates(
+        con, cutoff, target_customers, k_map["from_cooccurrence"], seed_map=seed_map
+    )
+    parts.append(_map_to_long(cooc_map, src_code["from_cooccurrence"]))
+    del cooc_map
+    con.execute("DROP TABLE IF EXISTS cooc_raw")  # 共起の中間テーブルは大きいので即解放
+    log("E 共起: done")
+
+    content_map = build_content_similarity_candidates(
+        con, cutoff, target_customers, k=k_map["from_content_similarity"], seed_map=seed_map
+    )
+    parts.append(_map_to_long(content_map, src_code["from_content_similarity"]))
+    del content_map, seed_map
+    log("F テキスト類似: done")
+
+    parts.append(_map_to_long(repeat_map, src_code["from_repeat"]))
+    del repeat_map
+
+    long_df = pd.concat(parts, ignore_index=True)
+    del parts
+    con.register("_cand_long", long_df)
+    con.register("_cand_targets", pd.DataFrame({"customer_idx": np.array(target_customers, dtype=np.int32)}))
+    con.register("_cand_pop", pd.DataFrame({"article_id": np.array(pop_list, dtype=np.int64)}))
+
+    union_sql = [
+        "SELECT customer_idx, article_id, src FROM _cand_long",
+        f"SELECT t.customer_idx, p.article_id, {src_code['from_trend']}::TINYINT AS src "
+        "FROM _cand_targets t CROSS JOIN _cand_pop p",
+    ]
+    if "age_trend" in extra_sources:
+        ensure_cust_age(con)
+        age_table = build_age_trend_table(con, cutoff, k=k_map.get("from_age_trend", 12))
+        union_sql.append(
+            f"SELECT t.customer_idx, a.article_id, {src_code['from_age_trend']}::TINYINT AS src "
+            f"FROM _cand_targets t JOIN cust_age ca USING (customer_idx) "
+            f"JOIN {age_table} a ON a.age_bucket = ca.age_bucket"
+        )
+    flags = ",\n            ".join(
+        f"MAX(CASE WHEN src = {i} THEN 1 ELSE 0 END)::TINYINT AS {name}" for i, name in enumerate(src_cols)
+    )
+    con.execute(f"""
+        CREATE OR REPLACE TABLE {table_name} AS
+        SELECT customer_idx::INTEGER AS customer_idx, article_id::BIGINT AS article_id,
+            {flags}
+        FROM ({' UNION ALL '.join(union_sql)})
+        GROUP BY 1, 2
+    """)
+    for name in ["_cand_long", "_cand_targets", "_cand_pop"]:
+        con.unregister(name)
+    del long_df
+    n_rows = con.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0]
+    log(f"候補プール: {n_rows:,}ペア")
+    return n_rows
+
+
+def build_candidate_pool(con, cutoff: str, target_customers, k_per_source=None, seed_k: int = 12,
+                         extra_sources=()) -> pd.DataFrame:
+    """候補ソースを統合し、(customer_idx, article_id)ごとにどのソース由来かのフラグを持つDataFrameを返す。
 
     候補ソースG(build_price_band_popularity_candidates, H5価格帯フィルタ人気)はbacktestは改善したが
     実LB(Public/Private)が悪化したため不採用(00_md/pipeline_build_log.md参照)。関数自体は残す。
@@ -389,59 +631,12 @@ def build_candidate_pool(con, cutoff: str, target_customers, k_per_source=None, 
     seed_k: アイテム共起(E)・テキスト類似(F)のシードに使う自己リピート候補の件数。
     from_repeatの出力件数を広げてもシードの質は12件のまま据え置きたい場合などに、
     k_per_source["from_repeat"]とは独立に指定できる。
+
+    実体は build_candidate_pool_table(duckdb内で統合)で、ここではそれをDataFrameとして取り出すだけ。
+    大規模データではDataFrame化せず build_candidate_pool_table を直接使うこと(features.pyはそうしている)。
     """
-    if k_per_source is None:
-        k_map = dict(DEFAULT_K_PER_SOURCE)
-    elif isinstance(k_per_source, int):
-        k_map = {name: k_per_source for name in DEFAULT_K_PER_SOURCE}
-    else:
-        k_map = {**DEFAULT_K_PER_SOURCE, **k_per_source}
-
-    target_customers = list({int(c) for c in target_customers})
-
-    repeat_map = build_repeat_candidates(con, cutoff, target_customers=target_customers, k=k_map["from_repeat"])
-    pop_list = build_popularity_candidates(con, cutoff, top_n=k_map["from_trend"])
-    category_map = build_category_color_candidates(
-        con, cutoff, target_customers=target_customers, k=k_map["from_category_color"]
-    )
-    cf_map = build_cf_candidates(con, cutoff, target_customers, k_map["from_cf"])
-
-    if seed_k == k_map["from_repeat"]:
-        seed_map = repeat_map
-    else:
-        seed_map = build_repeat_candidates(con, cutoff, target_customers=target_customers, k=seed_k)
-
-    cooc_map = build_cooccurrence_candidates(
-        con, cutoff, target_customers, k_map["from_cooccurrence"], seed_map=seed_map
-    )
-    content_map = build_content_similarity_candidates(
-        con, cutoff, target_customers, k=k_map["from_content_similarity"], seed_map=seed_map
-    )
-
-    rows = {}
-    for cid in target_customers:
-        sources = {
-            "from_repeat": repeat_map.get(cid, []),
-            "from_trend": pop_list,
-            "from_category_color": category_map.get(cid, []),
-            "from_cf": cf_map.get(cid, []),
-            "from_cooccurrence": cooc_map.get(cid, []),
-            "from_content_similarity": content_map.get(cid, []),
-        }
-        for src_name, articles in sources.items():
-            for article_id in articles:
-                key = (cid, int(article_id))
-                if key not in rows:
-                    rows[key] = {
-                        "customer_idx": cid,
-                        "article_id": int(article_id),
-                        "from_repeat": 0,
-                        "from_trend": 0,
-                        "from_category_color": 0,
-                        "from_cf": 0,
-                        "from_cooccurrence": 0,
-                        "from_content_similarity": 0,
-                    }
-                rows[key][src_name] = 1
-
-    return pd.DataFrame(rows.values())
+    build_candidate_pool_table(con, cutoff, target_customers, k_per_source, seed_k, extra_sources,
+                               table_name="_candidate_pool_df")
+    df = con.execute("SELECT * FROM _candidate_pool_df").df()
+    con.execute("DROP TABLE _candidate_pool_df")
+    return df
