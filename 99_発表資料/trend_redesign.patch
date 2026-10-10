@@ -1,0 +1,2787 @@
+From 5a3695219acfb2204e562fdd917c2b6be9d47752 Mon Sep 17 00:00:00 2001
+From: juli <woojoohyeon@gmail.com>
+Date: Mon, 21 Sep 2026 08:25:51 +0000
+Subject: [PATCH] Redesign around short-term trend hypothesis; fix Colab OOM
+ and eval bias
+
+Season-diverse holdout showed the YoY seasonal features (0917) have no
+season-general effect, so the pipeline now tests the hypothesis that recent
+momentum, newness and age-group trends drive fast-fashion purchases instead.
+
+- features.py: 18 opt-in short-term trend features; YoY features now opt-in;
+  labels, typing and output done inside duckdb (COPY to parquet) so no huge
+  pandas frame is built. Defaults still produce the 0906 35-column set.
+- candidates.py: optional age-bucket trend candidate source; pool assembly via
+  long-format arrays + duckdb GROUP BY (~520 -> ~130 bytes/pair, identical
+  output); deterministic ALS item indexing and tie-breaking.
+- train_protocol.py / run_trend_experiment.py / 09 notebook: train on
+  train2-4, early-stop on train1, report on val/holdout/season weeks only,
+  scored the way the submission is built; base/trend_feat/trend_full ablation
+  with paired customer bootstrap; refit + predict with age-trend cold start.
+  Runs the same on local and Google Colab (High-RAM).
+- multi_week_eval.py: auto-enables YoY/trend columns needed by scored models.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01DQARBgq55zxiVNGU2ijZVQ
+---
+ .gitignore                              |   1 +
+ 00_md/pipeline_build_log.md             |  77 ++++
+ CLAUDE.md                               |   8 +-
+ Z_notebook/04_feature_engineering.ipynb |   5 +-
+ Z_notebook/09_trend_hypothesis.ipynb    | 475 ++++++++++++++++++++
+ Z_notebook/build_one_cutoff.py          |  52 ++-
+ Z_notebook/candidates.py                | 309 ++++++++++---
+ Z_notebook/common.py                    |  69 ++-
+ Z_notebook/features.py                  | 534 +++++++++++++++-------
+ Z_notebook/multi_week_eval.py           |  19 +-
+ Z_notebook/run_trend_experiment.py      | 569 ++++++++++++++++++++++++
+ Z_notebook/train_protocol.py            | 259 +++++++++++
+ 12 files changed, 2133 insertions(+), 244 deletions(-)
+ create mode 100644 Z_notebook/09_trend_hypothesis.ipynb
+ create mode 100644 Z_notebook/run_trend_experiment.py
+ create mode 100644 Z_notebook/train_protocol.py
+
+diff --git a/.gitignore b/.gitignore
+index a14ecf5..3d5aeb2 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -4,6 +4,7 @@
+ 02_output/models/*
+ 02_output/features/*
+ 02_output/logs/*.log
++02_output/experiments/
+ !02_output/submission/.gitkeep
+ !02_output/models/.gitkeep
+ !02_output/features/.gitkeep
+diff --git a/00_md/pipeline_build_log.md b/00_md/pipeline_build_log.md
+index 1b4acac..eea23b4 100644
+--- a/00_md/pipeline_build_log.md
++++ b/00_md/pipeline_build_log.md
+@@ -365,6 +365,68 @@ Arrow Tableの段階でint8/int32/float32へcastするよう修正し(`_ARROW_DO
+ 手動で `ranker_path` と `BACKTEST_MAP12` を更新すること(2026-09-06時点、上記のとおりこの基準を
+ 厳密には満たさないまま0906版に更新している)。
+ 
++### 季節横断holdoutでの0917版の再検証(2026-09-21、Google Colab)
++
++0906版/0917版を再学習なしで季節を散らした5 cutoffでも採点した(既存3週は上表の値を流用)。
++詳細はClaude Project「パイプライン最新ステータス」11節。
++
++| cutoff | 季節 | 0906 | 0917 | 差 |
++|---|---|---|---|---|
++| 2019-09-21 | 秋(実テストと同季節・1年前) | 0.0263 | 0.0261 | -0.0002 |
++| 2019-11-16 | 秋〜初冬 | 0.0327 | 0.0327 | 0 |
++| 2019-12-21 | 冬(年末商戦) | 0.0288 | 0.0288 | 0 |
++| 2020-02-15 | 冬(閑散期) | 0.0292 | 0.0292 | 0 |
++| 2020-06-20 | 夏(COVID後の回復期) | 0.0225 | 0.0223 | -0.0002 |
++| 2020-07-28〜08-11 | 夏(既存3週) | 上表 | 上表 | +0.0001前後 |
++
++季節性特徴量は7〜8月でだけ効き、季節を平均すると差はほぼ0(平均-0.00001)。Private LBの悪化と整合する。
++公開されている上位解法も季節性を明示的には使わず、直近1〜6週の情報で学習・候補生成していた。
++
++### 短期トレンド仮説での再設計(2026-09-21)
++
++**仮説**: ファストファッションでは季節性(前年同週)より、直近数日〜数週の流行の勢い・新しさ・同年代での流行が
++購買を決める。0906版(現best)が既に「季節性なし・recency中心」の構成で最高値を出していることとも整合する。
++
++**変更内容**(既存ノートブック04/05/06の挙動は変えていない。新しい列・候補は明示的に有効化したときだけ作られる):
++
++- `features.py`: 短期トレンド特徴量18列(`TREND_FEATURES`)を追加。`include_trend=True` のときだけ計算する
++  - 商品の勢い: `i_sales_1d/3d/14d`, `i_sales_prev7d`, `i_wow_ratio`(前週比), `i_sales_decay`(半減期約5日の指数減衰),
++    `i_buyers_7d`, `i_rank_7d`
++  - 新しさ・値下げ: `i_days_since_first_sale`(365日で頭打ち。データ開始前の発売日は観測できないため),
++    `i_price_ratio_7d`(直近7日の平均価格/通常価格)
++  - 同年齢層での流行: `u_age`, `ia_sales_7d`, `ia_share_7d`, `ia_rank_7d`
++  - 売場の勢い: `sec_sales_7d`, `sec_wow_ratio` / ユーザーの新作志向: `u_item_age_at_purchase_avg`, `u_new_item_share`
++  - 0917版のYoY特徴量は既定で計算しない(`include_yoy=True` / `build_one_cutoff.py --include-yoy` で従来どおり)
++- `candidates.py`: 年齢層別トレンド人気の候補ソース(`from_age_trend`、`extra_sources=("age_trend",)` のときだけ)
++- `train_protocol.py` / `run_trend_experiment.py`(新規): 独立評価を守った学習・評価と3条件のablation
++  - train2〜4で学習 / train1でearly stopping / val・holdout1〜3(任意でseason1〜3)は**報告専用**
++    (05/07の「valでearly stoppingして同じvalで報告」という楽観バイアスを解消)
++  - `base`(0906と同じ35列・6ソース)/ `trend_feat`(+トレンド18列)/ `trend_full`(+年齢層別トレンド候補)を
++    1回の特徴量構築から作り分ける。base/trend_featは学習行・評価行が同一なので差が純粋に特徴量の効果になる
++  - 評価週のMAP@12は**提出ファイルと同じ作り方**で計算する(直近56日アクティブな顧客だけモデル上位12件、それ以外はフォールバック)。
++    従来の05/08は「評価週に買った顧客」も候補プールに入れてモデルで採点していたため、提出時にはモデルの対象外になる
++    非アクティブ顧客の分だけ楽観的だった(合成データでは正解を持つ顧客の約2割がこれに該当)
++  - フォールバックを全体人気(従来)/同年齢層の直近人気(`+agecold`)の2通りで採点し、コールドスタート部分の効果も切り出す
++  - 顧客単位のAP差をペアブートストラップして95%信頼区間を出す(LB上の±0.0002程度の差で結論を出さないため)。
++    pooledのCIは週ごとの揺れを含まないので、週ごとの勝敗(4分の3以上の週で改善)も採用条件にしている
++  - 任意で季節の異なる3週(2019-09-21 / 2019-12-21 / 2020-06-20、前回の季節横断検証と同じ日付)でも採点できる
++  - 候補プール・学習・評価は同じ入力なら完全に再現する(ALSの採番修正・同点の並びの固定・学習行の並びの固定)
++  - 提出: 評価で決めた木の本数で直近4週(val, train1〜3)にrefit。コールドスタート顧客は
++    `--cold-start age_trend`(同年齢層の直近人気)/ `global`(従来)を選べる
++- `09_trend_hypothesis.ipynb`(新規): 上記CLIをColab/ローカル両方で順に呼ぶノートブック
++- `multi_week_eval.py`: 採点するモデルの列を見て、YoY列・トレンド列・年齢層別トレンド候補が必要なら自動で作る
++  (08で0917版を再評価しても列不足にならない)
++- `common.py`: duckdbのメモリ上限・スレッド数・スピル先を環境変数(`HM_DUCKDB_MEMORY` / `HM_DUCKDB_THREADS` /
++  `HM_DUCKDB_TMP`)で切り替え可能に。`ensure_trans_lite()` を追加(01を開かずに新環境で始められる)
++
++**検証(合成データ)**: 実データと同じスキーマの小規模合成データで、build→train→report→refit→predictを通しで確認した
++(Colab相当のバージョン: pandas 2.2.2 / duckdb 1.1.3 / lightgbm 4.5.0 / pyarrow 18.1 でも確認)。
++既定設定の出力列が0906版の35列と一致すること、旧実装と同じ候補ペアでは0906版の全特徴量値が一致すること、
++旧実装と新実装の候補プール統合が同じソース出力に対して完全に同一の結果を返すことを確認済み。
++**実データでの結果はまだ無い**(合成データはトレンドが効くように作っているので、合成データ上の改善幅に意味はない)。
++
++**実データでの結果**: (未実施。09を実行したらここに週別MAP@12・信頼区間・特徴量重要度を追記する)
++
+ ---
+ 
+ ## 6. ハマったポイントと対策(重要、再度踏まないように)
+@@ -411,6 +473,18 @@ jetsamログ(`/Library/Logs/DiagnosticReports/JetsamEvent-*.ips`)で `Python` 
+    float32ダウンキャスト)を04でも使うよう修正し、1ファイルずつ軽量化してからconcatするように変更済み
+    (`04_feature_engineering.ipynb` のセル参照)。**素朴な複数parquetの読み込み+concatは、行数が増えるたびに
+    再発しうるので注意。**
++10. **ColabのHigh-RAM(51GB)でも、候補ペアの多いcutoff(2020-07-28、約3,100万ペア)で1プロセスが無言でOOM killされた**
++    (2026-09-21)。原因は3つ重なっていた(合成データでの実測+見積もり):
++    (a) `build_candidate_pool` が(cid, aid)をキーにしたPython辞書の辞書で候補を統合しており、1ペアあたり約520バイト
++    (3,100万ペアで約16GB)。→ 縦持ち配列+duckdbのGROUP BYに変更し約130バイト/ペア(約4GB)。結果は完全に同一
++    (b) `build_feature_table` が `.df()` で文字列列をobject dtypeのまま全行pandasに展開
++    (c) さらにpandasでラベルをmergeして全体のコピーをもう1つ作っていた
++    → ラベル付与・型の縮小(TINYINT/INTEGER/FLOAT)をduckdb内で行い、`write_feature_table` でparquetへ直接COPYする。
++    Macでは圧縮メモリ・スワップのおかげで耐えていたが、スワップの無いColabでは耐えられなかった。
++11. **ALS(候補D)の結果が実行ごとに微妙に変わっていた**(Colabで同じcutoffを再実行するとMAP@12が数値的に揺れた原因)。
++    duckdbのGROUP BY結果の行順が毎回変わり、それに引きずられて商品インデックスの採番(`unique()`の出現順)が変わるため、
++    同じ`random_state`でも初期値の割り当てが変わっていた。→ 商品IDをソートしてから採番するよう修正し、
++    ついでにROW_NUMBERの同点をarticle_idで決めるようにした。現在は同じ入力なら候補プールが完全に再現する。
+ 
+ ---
+ 
+@@ -429,6 +503,7 @@ jetsamログ(`/Library/Logs/DiagnosticReports/JetsamEvent-*.ips`)で `Python` 
+    「自己リピート/トレンド人気/同カテゴリ同色/協調フィルタリング」の4ソースのままで、E・Fが未記載。
+ 4. `common.py` のdocstringに「候補生成・特徴量エンジニアリングそのもののロジックはここに置かず、
+    各ノートブックに書く」とあるが、実際は `candidates.py` / `features.py` に切り出し済み。
++   → 2026-09-21に `common.py` のdocstringを修正済み。
+ 5. `README.md` が 06/07 と `candidates.py`/`features.py`/`training_data.py` の追加を反映していない
+    (`CLAUDE.md` 側は最新)。
+ 
+@@ -455,6 +530,8 @@ jetsamログ(`/Library/Logs/DiagnosticReports/JetsamEvent-*.ips`)で `Python` 
+   別の正規化方式を検討すること。
+ - 05/07ともに **valでearly stoppingを掛けたうえで同じvalでMAP@12を測っている**ため、
+   報告値は完全に独立した評価ではない(LBとの乖離幅を見るときはこの点に留意)
++  → 2026-09-21の `train_protocol.py`(09)では、early stopping用(train1)と報告用(val)を分けて解消済み。
++  05/07自体は過去の結果との比較のためそのまま残している
+ 
+ ---
+ 
+diff --git a/CLAUDE.md b/CLAUDE.md
+index 7503e59..4d60223 100644
+--- a/CLAUDE.md
++++ b/CLAUDE.md
+@@ -17,10 +17,12 @@ Kaggle「H&M Personalized Fashion Recommendations」コンペのリポジトリ
+   - `submission/` — 提出用csv
+   - `models/` — 学習済みモデル(pickle、`{"model":..., "feature_cols":..., "cat_cols":...}`の辞書形式)
+   - `features/` — 特徴量エンジニアリングの中間生成物(`trans_lite.parquet`, `train/val_features_*.parquet`, `content_similarity.parquet`)
++  - `experiments/` — `run_trend_experiment.py` の作業ディレクトリ(週ごとの特徴量・モデル・結果・レポート)
+   - `logs/` — 学習ログ
+-- `Z_notebook/` — 役割ごとに1ファイルのNotebook: `01_eda.ipynb` → `02_baseline.ipynb` → `03_candidate_generation.ipynb` → `04_feature_engineering.ipynb` → `05_train_lgbm.ipynb` → `06_predict_submit.ipynb` → `07_optuna_tune.ipynb`(以降追加時も連番を継続)。
+-  共有モジュール: `common.py`(duckdb接続・バックテスト分割・MAP@12/Recall@12・提出フォーマット・実験ログ追記・共通パス定数)、`candidates.py`(6候補ソースの生成ロジック、target_customersで絞り込み可能)、`features.py`(候補×特徴量×ラベルのテーブル構築)、`training_data.py`(大規模train/valのOOM対策込みロード)。
+-  CLIスクリプト(サブプロセスとして呼ぶ想定): `build_one_cutoff.py`(1cutoff分の特徴量構築)、`build_content_similarity.py`(商品テキストのTF-IDF類似度事前計算)
++- `Z_notebook/` — 役割ごとに1ファイルのNotebook: `01_eda.ipynb` → `02_baseline.ipynb` → `03_candidate_generation.ipynb` → `04_feature_engineering.ipynb` → `05_train_lgbm.ipynb` → `06_predict_submit.ipynb` → `07_optuna_tune.ipynb` → `08_multi_week_backtest.ipynb` → `09_trend_hypothesis.ipynb`(短期トレンド仮説の検証、Colab/ローカル両対応)(以降追加時も連番を継続)。
++  共有モジュール: `common.py`(duckdb接続・バックテスト分割・MAP@12/Recall@12・提出フォーマット・実験ログ追記・共通パス定数・`ensure_trans_lite`)、`candidates.py`(6候補ソース+任意の年齢層別トレンド候補の生成ロジック、target_customersで絞り込み可能)、`features.py`(候補×特徴量×ラベルのテーブル構築。特徴量セット`BASE_0906_FEATURES`/`TREND_FEATURES`/`YOY_FEATURES`)、`training_data.py`(大規模train/valのOOM対策込みロード)、`multi_week_eval.py`(既存モデルの複数週再評価)、`train_protocol.py`(独立評価を守った学習・評価・ブートストラップ)。
++  CLIスクリプト(サブプロセスとして呼ぶ想定): `build_one_cutoff.py`(1cutoff分の特徴量構築、parquetへ直接書き出し)、`build_content_similarity.py`(商品テキストのTF-IDF類似度事前計算)、`run_trend_experiment.py`(09の本体: build/train/report/refit/predict)
++  duckdbのメモリ上限等は環境変数 `HM_DUCKDB_MEMORY`(既定12GB)/`HM_DUCKDB_THREADS`/`HM_DUCKDB_TMP` で切り替える(Colab High-RAMなら20GB)。
+ - `experiment_log.csv` — 実験記録
+ 
+ ## バージョン管理・成果物の運用ルール
+diff --git a/Z_notebook/04_feature_engineering.ipynb b/Z_notebook/04_feature_engineering.ipynb
+index f88a50c..8dbc6e6 100644
+--- a/Z_notebook/04_feature_engineering.ipynb
++++ b/Z_notebook/04_feature_engineering.ipynb
+@@ -10,8 +10,9 @@
+     "`03_candidate_generation.ipynb` で検証した6候補ソース(`candidates.py`に共通化、Fのテキスト類似含む)を使い、\n",
+     "(customer_idx, article_id) ペアごとに user系・item系・user-item交差系・時間系の特徴量とラベルを作る。\n",
+     "特徴量テーブル構築のロジック自体は `features.py` の `build_feature_table()` に共通化してあり、05/06からも再利用する。\n",
+-    "季節性特徴量(i_sales_yoy_7d/cat_sales_yoy_7d/cat_sales_recent_28d/cat_seasonal_lift、target週の1年前にあたる週の実績)\n",
+-    "も含む(00_md/pipeline_build_log.md「季節性特徴量の追加」節参照)。\n",
++    "季節性特徴量(i_sales_yoy_7d/cat_sales_yoy_7d/cat_sales_recent_28d/cat_seasonal_lift)は0917版で試したが不採用となり、\n",
++    "2026-09-21以降は既定で計算しない(このノートブックを再実行すると0906版と同じ35列になる。`build_one_cutoff.py --include-yoy`で従来どおり作れる)。\n",
++    "短期トレンド仮説での新しい特徴量・評価プロトコルは`09_trend_hypothesis.ipynb`/`run_trend_experiment.py`を参照(00_md/pipeline_build_log.md「短期トレンド仮説での再設計」節)。\n",
+     "\n",
+     "## 学習/検証の週構成(改訂: 学習週を2→4週に拡張)\n",
+     "\n",
+diff --git a/Z_notebook/09_trend_hypothesis.ipynb b/Z_notebook/09_trend_hypothesis.ipynb
+new file mode 100644
+index 0000000..037916e
+--- /dev/null
++++ b/Z_notebook/09_trend_hypothesis.ipynb
+@@ -0,0 +1,475 @@
++{
++ "cells": [
++  {
++   "cell_type": "markdown",
++   "metadata": {},
++   "source": [
++    "# 09_trend_hypothesis — 短期トレンド仮説の検証(Google Colab / ローカル両対応)\n",
++    "\n",
++    "**仮説**: ファストファッションでは、季節性(前年同週の売れ方)よりも「直近数日〜数週の流行の勢い・新しさ・同年代での流行」が購買を決める。\n",
++    "\n",
++    "- 根拠1: 季節横断holdout(8 cutoff)で、0917版のYoY季節性特徴量は平均差≈0で効果なし(`00_md/pipeline_build_log.md` / Claude Project「パイプライン最新ステータス」11節)\n",
++    "- 根拠2: 公開されている上位解法の多くは直近1〜6週の情報だけで学習・候補生成しており、季節性を明示的に使っていない\n",
++    "\n",
++    "**このノートブックでやること**(重い処理は全て `run_trend_experiment.py` をサブプロセスで呼ぶ。カーネルにメモリが溜まらない):\n",
++    "\n",
++    "| 条件 | 候補プール | 特徴量 | 何を測るか |\n",
++    "|---|---|---|---|\n",
++    "| `base` | 0906版と同じ6ソース | 0906版と同じ35列 | 対照群(同じプロトコルで学習し直した0906相当) |\n",
++    "| `trend_feat` | 同上 | + 短期トレンド18列 | 特徴量だけの効果 |\n",
++    "| `trend_full` | + 年齢層別トレンド候補 | + `from_age_trend` | 候補追加の効果 |\n",
++    "\n",
++    "**評価の独立性**: train2〜4で学習 / train1でearly stopping / val・holdout1〜3(と任意でseason1〜3)は報告専用。差は顧客単位のペアブートストラップで95%信頼区間を出す。\n",
++    "\n",
++    "**Colabの前提**: ランタイムは **CPU + 高RAM(High-RAM, 約51GB)**。標準(12.7GB)では学習データの読み込みで足りない。\n",
++    "所要時間の目安: 特徴量構築 1週あたり15〜25分 × 9週(最終提出用含む)、学習+採点 1〜1.5時間。\n",
++    "各ステップは途中で落ちても、同じセルを再実行すれば終わったところから再開する。"
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "metadata": {},
++   "source": [
++    "## 0. 設定"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "metadata": {},
++   "execution_count": null,
++   "outputs": [],
++   "source": [
++    "import glob, os, sys, shutil, subprocess\n",
++    "\n",
++    "REPO_URL = \"https://github.com/woojoohyeon-cpu/kaggle_hm.git\"\n",
++    "BRANCH = \"main\"\n",
++    "\n",
++    "# 小さい成果物(モデル・結果・提出ファイル・ログ)の保存先。前回モデルを置いたのと同じDriveフォルダ\n",
++    "DRIVE_DIR = \"/content/drive/MyDrive/Colab Notebooks/hm\"\n",
++    "# 特徴量parquet(1週あたり約0.7GB×9週)の置き場所。Colabのローカルディスク(ランタイムが消えると消える)\n",
++    "COLAB_WORK_DIR = \"/content/hm_work\"\n",
++    "\n",
++    "# duckdbのメモリ上限。High-RAM(51GB)なら20GB。標準ランタイムでは動かさないこと\n",
++    "DUCKDB_MEMORY = \"20GB\"\n",
++    "\n",
++    "try:\n",
++    "    import google.colab  # noqa: F401\n",
++    "    IN_COLAB = True\n",
++    "except ImportError:\n",
++    "    IN_COLAB = False\n",
++    "print(\"IN_COLAB =\", IN_COLAB)\n",
++    "\n",
++    "LOG_PATH = None  # セル5で設定(Colabでは Drive 上のログにも追記する)\n",
++    "\n",
++    "\n",
++    "def sh(cmd, cwd=None):\n",
++    "    # 外部コマンドを実行し、出力を1行ずつこのセルに表示する(Colabでも確実に表示されるようにパイプ経由で読む)\n",
++    "    print(\"$\", \" \".join(cmd), flush=True)\n",
++    "    logf = open(LOG_PATH, \"a\") if LOG_PATH else None\n",
++    "    with subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1) as proc:\n",
++    "        for line in proc.stdout:\n",
++    "            if \"it/s]\" in line:   # ALSの進捗バー(大量に出る)は省略\n",
++    "                continue\n",
++    "            print(line, end=\"\", flush=True)\n",
++    "            if logf:\n",
++    "                logf.write(line); logf.flush()\n",
++    "    if logf:\n",
++    "        logf.close()\n",
++    "    if proc.returncode != 0:\n",
++    "        hint = \" (-9はOSによる強制終了=メモリ不足の可能性が高い)\" if proc.returncode in (-9, 137) else \"\"\n",
++    "        raise RuntimeError(f\"失敗しました returncode={proc.returncode}{hint}\")"
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "metadata": {},
++   "source": [
++    "## 1. 実行環境の確認(RAMが足りるか)"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "metadata": {},
++   "execution_count": null,
++   "outputs": [],
++   "source": [
++    "import psutil\n",
++    "total_gb = psutil.virtual_memory().total / 1e9\n",
++    "print(f\"RAM: {total_gb:.1f} GB / CPU: {os.cpu_count()} コア\")\n",
++    "if total_gb < 40:\n",
++    "    print(\"⚠️ RAMが40GB未満です。Colabなら『ランタイム → ランタイムのタイプを変更 → 高RAM』に切り替えてください。\"\n",
++    "          \"このまま進めると学習データ読み込み時にメモリ不足で落ちる可能性が高いです。\")"
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "metadata": {},
++   "source": [
++    "## 2. Google Driveのマウントとリポジトリの取得(Colabのみ)\n",
++    "\n",
++    "リポジトリは毎回 `/content/kaggle_hm` にclone(既にあれば `git pull`)する。**先にローカルでコミットしたコードをGitHubにpushしておくこと。**"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "metadata": {},
++   "execution_count": null,
++   "outputs": [],
++   "source": [
++    "if IN_COLAB:\n",
++    "    from google.colab import drive\n",
++    "    drive.mount(\"/content/drive\")\n",
++    "    os.makedirs(DRIVE_DIR, exist_ok=True)\n",
++    "    os.chdir(\"/content\")\n",
++    "    if not os.path.exists(\"/content/kaggle_hm/.git\"):\n",
++    "        sh([\"git\", \"clone\", \"-b\", BRANCH, REPO_URL, \"/content/kaggle_hm\"])\n",
++    "    else:\n",
++    "        sh([\"git\", \"-C\", \"/content/kaggle_hm\", \"pull\", \"--ff-only\"])\n",
++    "    REPO_DIR = \"/content/kaggle_hm\"\n",
++    "else:\n",
++    "    REPO_DIR = os.path.abspath(\"..\")  # ローカルではZ_notebook/からこのノートブックを開いている前提\n",
++    "\n",
++    "NB_DIR = os.path.join(REPO_DIR, \"Z_notebook\")\n",
++    "os.chdir(NB_DIR)\n",
++    "print(\"cwd:\", os.getcwd())\n",
++    "sh([\"git\", \"-C\", REPO_DIR, \"log\", \"--oneline\", \"-3\"])"
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "metadata": {},
++   "source": [
++    "## 3. 依存ライブラリ(Colabのみ。lightgbm/pyarrow/pandasはColabに入っている)"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "metadata": {},
++   "execution_count": null,
++   "outputs": [],
++   "source": [
++    "if IN_COLAB:\n",
++    "    sh([sys.executable, \"-m\", \"pip\", \"install\", \"-q\", \"duckdb\", \"implicit\", \"kaggle\"])\n",
++    "import duckdb, lightgbm, implicit, pandas, pyarrow\n",
++    "print(\"duckdb\", duckdb.__version__, \"/ lightgbm\", lightgbm.__version__, \"/ implicit\", implicit.__version__,\n",
++    "      \"/ pandas\", pandas.__version__, \"/ pyarrow\", pyarrow.__version__)"
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "metadata": {},
++   "source": [
++    "## 4. Kaggle認証とデータのダウンロード(未取得のファイルだけ)\n",
++    "\n",
++    "トークンはノートブックに直接書かず、Colab左側の🔑(シークレット)に `KAGGLE_API_TOKEN` という名前で登録しておく\n",
++    "(値は kaggle.com/settings の「API Tokens」で発行した `KGAT_...` の文字列。ノートブックへのアクセスを許可するのを忘れずに)。\n",
++    "ローカルでは `~/.kaggle/access_token` が既にある前提。"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "metadata": {},
++   "execution_count": null,
++   "outputs": [],
++   "source": [
++    "token_path = os.path.expanduser(\"~/.kaggle/access_token\")\n",
++    "if IN_COLAB and not os.path.exists(token_path):\n",
++    "    from google.colab import userdata\n",
++    "    token = userdata.get(\"KAGGLE_API_TOKEN\")\n",
++    "    os.makedirs(os.path.dirname(token_path), exist_ok=True)\n",
++    "    with open(token_path, \"w\") as f:\n",
++    "        f.write(token.strip())\n",
++    "    os.chmod(token_path, 0o600)\n",
++    "print(\"Kaggleトークン:\", \"OK\" if os.path.exists(token_path) else \"見つかりません\")\n",
++    "\n",
++    "INPUT_DIR = os.path.join(REPO_DIR, \"01_input\")\n",
++    "os.makedirs(INPUT_DIR, exist_ok=True)\n",
++    "COMP = \"h-and-m-personalized-fashion-recommendations\"\n",
++    "for fname in [\"articles.csv\", \"customers.csv\", \"transactions_train.csv\", \"sample_submission.csv\"]:\n",
++    "    if os.path.exists(os.path.join(INPUT_DIR, fname)):\n",
++    "        print(f\"[skip] {fname}\")\n",
++    "        continue\n",
++    "    sh([\"kaggle\", \"competitions\", \"download\", \"-c\", COMP, \"-f\", fname, \"-p\", INPUT_DIR])\n",
++    "    z = os.path.join(INPUT_DIR, fname + \".zip\")\n",
++    "    if os.path.exists(z):\n",
++    "        sh([\"unzip\", \"-o\", \"-q\", z, \"-d\", INPUT_DIR])\n",
++    "        os.remove(z)\n",
++    "    print(f\"[ok] {fname}\")\n",
++    "sh([\"ls\", \"-la\", INPUT_DIR])"
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "metadata": {},
++   "source": [
++    "## 5. 環境変数(duckdbのメモリ・作業ディレクトリ・同期先)と前処理(trans_lite / テキスト類似度)"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "metadata": {},
++   "execution_count": null,
++   "outputs": [],
++   "source": [
++    "os.environ[\"HM_DUCKDB_MEMORY\"] = DUCKDB_MEMORY\n",
++    "os.environ[\"HM_DUCKDB_THREADS\"] = str(os.cpu_count())\n",
++    "if IN_COLAB:\n",
++    "    os.environ[\"HM_DUCKDB_TMP\"] = \"/content/duckdb_tmp\"          # スピル先はローカルディスク\n",
++    "    os.environ[\"HM_WORK_DIR\"] = COLAB_WORK_DIR\n",
++    "    os.environ[\"HM_SYNC_DIR\"] = os.path.join(DRIVE_DIR, \"trend_experiment\")\n",
++    "else:\n",
++    "    os.environ.pop(\"HM_SYNC_DIR\", None)                          # ローカルは 02_output/experiments/trend\n",
++    "    os.environ.pop(\"HM_WORK_DIR\", None)\n",
++    "work_dir = os.environ.get(\"HM_WORK_DIR\", os.path.join(REPO_DIR, \"02_output\", \"experiments\", \"trend\"))\n",
++    "print({k: v for k, v in os.environ.items() if k.startswith(\"HM_\")}, \"work_dir =\", work_dir)\n",
++    "if IN_COLAB:\n",
++    "    os.makedirs(os.environ[\"HM_SYNC_DIR\"], exist_ok=True)\n",
++    "    LOG_PATH = os.path.join(os.environ[\"HM_SYNC_DIR\"], \"run.log\")   # ブラウザを閉じてもDriveで進捗を確認できる\n",
++    "    print(\"ログ:\", LOG_PATH)\n",
++    "\n",
++    "sys.path.insert(0, NB_DIR)\n",
++    "from common import ensure_trans_lite, FEATURES_DIR\n",
++    "ensure_trans_lite()\n",
++    "sim_path = os.path.join(FEATURES_DIR, \"content_similarity.parquet\")\n",
++    "if not os.path.exists(sim_path):\n",
++    "    sh([sys.executable, \"build_content_similarity.py\", \"--out\", sim_path])\n",
++    "else:\n",
++    "    print(\"[skip] content_similarity.parquet\")"
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "metadata": {},
++   "source": [
++    "## 6. STEP 1: 特徴量テーブルの構築(学習・評価に必要な5週)\n",
++    "\n",
++    "1週ずつ別プロセスで作る(1週の処理が終わるたびにメモリがOSに返る)。途中で止まっても、再実行すれば作成済みの週は飛ばす。\n",
++    "メモリ不足でOSに強制終了された場合は、黙って消えずに `returncode=-9 ... メモリ不足の可能性が高い` と表示される。"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "metadata": {},
++   "execution_count": null,
++   "outputs": [],
++   "source": [
++    "def run(*args):\n",
++    "    sh([sys.executable, \"-u\", \"run_trend_experiment.py\", *args])\n",
++    "\n",
++    "run(\"build\", \"--only\", \"val,train1,train2,train3,train4\")"
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "metadata": {},
++   "source": [
++    "## 7. STEP 2: 3条件の学習と評価(val週)\n",
++    "\n",
++    "学習済みの条件は飛ばして評価だけ行う。最後にレポート(週別MAP@12・ブートストラップ信頼区間・特徴量重要度)が出る。"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "metadata": {},
++   "execution_count": null,
++   "outputs": [],
++   "source": [
++    "run(\"train\")"
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "metadata": {},
++   "source": [
++    "## 8. STEP 3: holdout 3週を追加して再評価(週ごとのばらつきを見る)\n",
++    "\n",
++    "学習はやり直さず、追加した週の採点だけ行う。1週だけの結果で判断しないためのステップ(これまでoptuna・候補G・季節性特徴量で\n",
++    "「1週では良く見えたがLBで悪化」を3回経験している)。"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "metadata": {},
++   "execution_count": null,
++   "outputs": [],
++   "source": [
++    "run(\"build\", \"--only\", \"holdout1,holdout2,holdout3\")\n",
++    "run(\"train\")"
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "metadata": {},
++   "source": [
++    "## 8b. (任意)季節の異なる3週でも採点する(2019-09-21 秋 / 2019-12-21 冬 / 2020-06-20 夏)\n",
++    "\n",
++    "前回の季節横断検証と同じ日付。短期トレンド特徴量の効果が「今の季節だけ」のものでないかを確認する(0917版の季節性特徴量は\n",
++    "7〜8月でだけ効いて他の季節では効かず、Private LBで悪化した)。3週分の構築で+1時間ほどかかる。"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "metadata": {},
++   "execution_count": null,
++   "outputs": [],
++   "source": [
++    "RUN_SEASON_WEEKS = False\n",
++    "if RUN_SEASON_WEEKS:\n",
++    "    run(\"build\", \"--only\", \"season1,season2,season3\")\n",
++    "    run(\"train\")"
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "metadata": {},
++   "source": [
++    "## 9. (任意)現行ベスト0906版モデルも同じ週で採点して並べる\n",
++    "\n",
++    "前回Driveに置いた `model_20260906_0924_ranker.pkl` と `train_categories_0906.pkl` を使う。\n",
++    "0906版はval週でearly stoppingしているため、val週の数字は楽観的(holdout週の比較の方が公平)。"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "metadata": {},
++   "execution_count": null,
++   "outputs": [],
++   "source": [
++    "ref_model = os.path.join(DRIVE_DIR, \"model_20260906_0924_ranker.pkl\") if IN_COLAB else \\\n",
++    "    os.path.join(REPO_DIR, \"02_output\", \"models\", \"model_20260906_0924_ranker.pkl\")\n",
++    "ref_cats = os.path.join(os.path.dirname(ref_model), \"train_categories_0906.pkl\")\n",
++    "if os.path.exists(ref_model) and os.path.exists(ref_cats):\n",
++    "    run(\"score-ref\", \"--model\", ref_model, \"--categories\", ref_cats, \"--label\", \"ref_0906\")\n",
++    "else:\n",
++    "    print(\"0906版のファイルが見つからないのでスキップ:\", ref_model, ref_cats)"
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "metadata": {},
++   "source": [
++    "## 10. レポートの表示"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "metadata": {},
++   "execution_count": null,
++   "outputs": [],
++   "source": [
++    "from IPython.display import Markdown, display\n",
++    "with open(os.path.join(work_dir, \"results\", \"report.md\")) as f:\n",
++    "    display(Markdown(f.read()))"
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "metadata": {},
++   "source": [
++    "## 11. STEP 4: 提出ファイルの作成\n",
++    "\n",
++    "レポートを見て採用する条件を決めてから実行する。判断の目安:\n",
++    "\n",
++    "- `trend_full` / `trend_feat` の **pooled 95%CI下限 > 0** かつ **4分の3以上の週で改善** → 採用して提出\n",
++    "- CIが0をまたぐ → 差はノイズと区別できない。提出して確かめるのは良いが、LBの±0.0002程度の差で結論を出さない\n",
++    "\n",
++    "`refit` は評価で決まった木の本数を固定し、直近4週(val, train1〜3)で学習し直す。\n",
++    "`--cold-start age_trend` は、モデルの対象外の顧客(直近56日に購入なし。全顧客の半分以上)に「同じ年齢層で直近7日に売れている上位12件」を出す\n",
++    "(`global` にすると従来どおり全体の上位12件)。レポートの `+agecold` 列がこの設定での評価値なので、先にそちらで効果を確認できる。"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "metadata": {},
++   "execution_count": null,
++   "outputs": [],
++   "source": [
++    "CHOSEN = \"trend_full\"        # レポートを見て決める: base / trend_feat / trend_full\n",
++    "COLD_START = \"age_trend\"     # age_trend / global\n",
++    "\n",
++    "run(\"refit\", \"--variant\", CHOSEN)\n",
++    "run(\"predict\", \"--variant\", CHOSEN, \"--cold-start\", COLD_START)"
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "metadata": {},
++   "source": [
++    "## 12. (任意)Kaggleへ提出してスコアを確認"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "metadata": {},
++   "execution_count": null,
++   "outputs": [],
++   "source": [
++    "SUBMIT = False   # Trueにすると最新の提出ファイルを提出する\n",
++    "\n",
++    "subs = sorted(glob.glob(os.path.join(work_dir, \"submission\", \"submission_*.csv\")))\n",
++    "print(\"最新:\", subs[-1] if subs else None)\n",
++    "if SUBMIT and subs:\n",
++    "    sh([\"kaggle\", \"competitions\", \"submit\", \"-c\", COMP, \"-f\", subs[-1],\n",
++    "        \"-m\", f\"trend {CHOSEN} cold_start={COLD_START}\"])\n",
++    "if shutil.which(\"kaggle\"):\n",
++    "    sh([\"kaggle\", \"competitions\", \"submissions\", \"-c\", COMP])"
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "metadata": {},
++   "source": [
++    "## 13. (任意)特徴量parquetをDriveにバックアップ/復元\n",
++    "\n",
++    "Colabのランタイムが切れる(リセットされる)と `/content/hm_work/features` は消え、STEP 1からやり直しになる。\n",
++    "Driveに約7GBの空きがあれば、STEP 1・3の後にバックアップしておくと、次回はここから復元して続きから始められる。"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "metadata": {},
++   "execution_count": null,
++   "outputs": [],
++   "source": [
++    "BACKUP = os.path.join(DRIVE_DIR, \"trend_experiment\", \"features_backup\")\n",
++    "ACTION = None   # \"backup\" / \"restore\" / None\n",
++    "\n",
++    "src_dir = os.path.join(COLAB_WORK_DIR, \"features\")\n",
++    "if ACTION == \"backup\":\n",
++    "    os.makedirs(BACKUP, exist_ok=True)\n",
++    "    for f in glob.glob(os.path.join(src_dir, \"*.parquet\")):\n",
++    "        dst = os.path.join(BACKUP, os.path.basename(f))\n",
++    "        if not os.path.exists(dst):\n",
++    "            shutil.copy2(f, dst); print(\"backup:\", os.path.basename(f))\n",
++    "elif ACTION == \"restore\":\n",
++    "    os.makedirs(src_dir, exist_ok=True)\n",
++    "    for f in glob.glob(os.path.join(BACKUP, \"*.parquet\")):\n",
++    "        dst = os.path.join(src_dir, os.path.basename(f))\n",
++    "        if not os.path.exists(dst):\n",
++    "            shutil.copy2(f, dst); print(\"restore:\", os.path.basename(f))\n",
++    "    manifest_src = os.path.join(DRIVE_DIR, \"trend_experiment\", \"manifest.json\")\n",
++    "    if os.path.exists(manifest_src):\n",
++    "        shutil.copy2(manifest_src, os.path.join(COLAB_WORK_DIR, \"manifest.json\"))\n",
++    "    for sub in [\"models\", \"results\"]:\n",
++    "        sub_src = os.path.join(DRIVE_DIR, \"trend_experiment\", sub)\n",
++    "        if os.path.exists(sub_src):\n",
++    "            shutil.copytree(sub_src, os.path.join(COLAB_WORK_DIR, sub), dirs_exist_ok=True)"
++   ]
++  }
++ ],
++ "metadata": {
++  "kernelspec": {
++   "display_name": "Python 3",
++   "language": "python",
++   "name": "python3"
++  },
++  "language_info": {
++   "name": "python"
++  },
++  "colab": {
++   "provenance": []
++  }
++ },
++ "nbformat": 4,
++ "nbformat_minor": 4
++}
+diff --git a/Z_notebook/build_one_cutoff.py b/Z_notebook/build_one_cutoff.py
+index 6d13c43..32d42b4 100644
+--- a/Z_notebook/build_one_cutoff.py
++++ b/Z_notebook/build_one_cutoff.py
+@@ -1,14 +1,26 @@
+ """1つのcutoffの候補+特徴量テーブルを作ってparquetに保存するCLIスクリプト。
+ 
+-04_feature_engineering.ipynbからサブプロセスとして呼び出す想定(cutoffごとにOSプロセスを分離することで、
+-5週分を1つのカーネルに溜め込んでOOM killされる問題を回避する。jetsamログでPythonプロセスの
+-OOM killを確認済み)。
++04_feature_engineering.ipynb / run_trend_experiment.py からサブプロセスとして呼び出す想定
++(cutoffごとにOSプロセスを分離することで、複数週分を1つのカーネルに溜め込んでOOM killされる問題を回避する)。
++
++テーブルはduckdbから直接parquetに書き出す(features.write_feature_table)。Python側に巨大なDataFrameを
++作らないため、以前の実装より1プロセスあたりのピークメモリが大幅に小さい。
++
++例:
++    python build_one_cutoff.py --name train1 --cutoff 2020-09-08 --out ../02_output/features/x.parquet
++    python build_one_cutoff.py --name val --cutoff 2020-09-15 --out x.parquet --trend --extra-sources age_trend
+ """
+ 
+ import argparse
++import os
++import time
+ 
+-from common import get_con
+-from features import build_feature_table
++# implicit(ALS)はOpenBLASのスレッドと自前スレッドが競合すると極端に遅くなるため1に固定する
++os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
++os.environ.setdefault("MKL_NUM_THREADS", "1")
++
++from common import get_con  # noqa: E402
++from features import write_feature_table  # noqa: E402
+ 
+ 
+ def main():
+@@ -17,17 +29,33 @@ def main():
+     parser.add_argument("--cutoff", required=True)
+     parser.add_argument("--out", required=True)
+     parser.add_argument("--no-label", action="store_true")
++    parser.add_argument("--extra-sources", default="", help="カンマ区切り。例: age_trend")
++    parser.add_argument("--trend", action="store_true",
++                        help="短期トレンド特徴量(features.TREND_FEATURES)も計算する。既定はOFF(04/05の従来構成と同じ列)")
++    parser.add_argument("--include-yoy", action="store_true", help="0917版の季節性(YoY)特徴量も計算する")
++    parser.add_argument("--trailing-days", type=int, default=56)
+     args = parser.parse_args()
+ 
++    extra_sources = tuple(s for s in args.extra_sources.split(",") if s)
++    t0 = time.time()
+     con = get_con()
+-    feature_df = build_feature_table(con, args.cutoff, with_label=not args.no_label)
+-    feature_df.to_parquet(args.out, index=False)
+-
+-    print(f"[{args.name}] cutoff={args.cutoff} shape={feature_df.shape}", end="")
++    tmp_out = args.out + ".tmp"
++    n_rows = write_feature_table(
++        con, args.cutoff, tmp_out,
++        with_label=not args.no_label,
++        trailing_days=args.trailing_days,
++        extra_sources=extra_sources,
++        include_trend=args.trend,
++        include_yoy=args.include_yoy,
++    )
++    positive = ""
+     if not args.no_label:
+-        print(f" positive_rate={feature_df['label'].mean():.6f}")
+-    else:
+-        print()
++        rate = con.execute(f"SELECT AVG(label) FROM read_parquet('{tmp_out}')").fetchone()[0]
++        positive = f" positive_rate={rate:.6f}"
++    con.close()
++    # 書き込み途中で落ちたファイルを「完成品」と誤認しないよう、完了後にrenameする
++    os.replace(tmp_out, args.out)
++    print(f"[{args.name}] cutoff={args.cutoff} rows={n_rows:,}{positive} ({(time.time() - t0) / 60:.1f}分)")
+     print(f"[{args.name}] 保存しました: {args.out}")
+ 
+ 
+diff --git a/Z_notebook/candidates.py b/Z_notebook/candidates.py
+index 2ffb363..0ca8450 100644
+--- a/Z_notebook/candidates.py
++++ b/Z_notebook/candidates.py
+@@ -1,9 +1,19 @@
+-"""候補生成ロジック(自己リピート/トレンド人気/同カテゴリ同色/協調フィルタリング/アイテム共起/テキストコンテンツ類似)。
++"""候補生成ロジック。
++
++既定の6ソース: A自己リピート / Bトレンド人気(全体) / C同カテゴリ同色 / D協調フィルタリング(ALS) /
++Eアイテム共起 / Fテキストコンテンツ類似。
++追加ソース(extra_sourcesで明示的に有効化した時のみ): H年齢層別トレンド人気(`age_trend`)。
+ 
+ 03_candidate_generation.ipynb でソースごとのRecall@12/MAP@12を検証済み(参照: 00_md/hypothesis_driven_design.md)。
+-04以降のノートブックはこのモジュールを共有して使う。
++04以降のノートブック・CLIはこのモジュールを共有して使う。
++
++候補プールの統合(`build_candidate_pool_table`)は、(customer_idx, article_id, source)の縦持ち配列を作ってから
++duckdbでGROUP BYしてフラグ列に展開する。以前の「(cid, aid)をキーにしたPython辞書の辞書」方式は
++3,000万ペア規模でPythonオブジェクトだけで十数GBを消費し、Colab(スワップなし)でOOM killされる主因だった
++(00_md/pipeline_build_log.md「短期トレンド仮説での再設計」節参照)。出力の中身(ペア集合とフラグ)は同一。
+ """
+ 
++import itertools
+ import os
+ 
+ import numpy as np
+@@ -11,6 +21,48 @@ import pandas as pd
+ import implicit
+ from scipy.sparse import coo_matrix
+ 
++from common import DATA_DIR
++
++# 候補プールのフラグ列。順序はbuild_candidate_pool(旧実装)の列順と同じ。
++BASE_SOURCE_COLS = [
++    "from_repeat",
++    "from_trend",
++    "from_category_color",
++    "from_cf",
++    "from_cooccurrence",
++    "from_content_similarity",
++]
++EXTRA_SOURCE_COLS = {"age_trend": "from_age_trend"}
++
++# 年齢層の区切り。NULL(年齢不明)は-1として独立した層にする。
++AGE_BUCKET_EDGES = [20, 25, 30, 40, 50, 60]
++
++
++def age_bucket_sql(col: str) -> str:
++    """年齢列を年齢層番号(-1: 不明, 0: <20, 1: 20-24, ..., 6: 60+)に変換するSQL式。"""
++    cases = " ".join(f"WHEN {col} < {edge} THEN {i}" for i, edge in enumerate(AGE_BUCKET_EDGES))
++    return f"(CASE WHEN {col} IS NULL THEN -1 {cases} ELSE {len(AGE_BUCKET_EDGES)} END)"
++
++
++def ensure_cust_age(con) -> None:
++    """customer_idx -> (age, age_bucket) の対応表 cust_age をduckdbに作る(既にあれば何もしない)。
++
++    cust_mapはget_con()で作られている前提。trans_liteにもage列はあるが、期間内に購入のない顧客
++    (コールドスタート)の年齢も必要なため customers.csv から作る。
++    """
++    exists = con.execute(
++        "SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'cust_age'"
++    ).fetchone()[0]
++    if exists:
++        return
++    con.execute(f"""
++        CREATE TABLE cust_age AS
++        SELECT cm.customer_idx, c.age::SMALLINT AS age, {age_bucket_sql('c.age')}::TINYINT AS age_bucket
++        FROM cust_map cm
++        LEFT JOIN read_csv_auto('{DATA_DIR}/customers.csv') c USING (customer_id)
++    """)
++
++
+ _CONTENT_SIM_PATH = os.path.join(
+     os.path.dirname(os.path.abspath(__file__)), "..", "02_output", "features", "content_similarity.parquet"
+ )
+@@ -48,7 +100,7 @@ def build_content_similarity_candidates(con, cutoff: str, target_customers, k: i
+         for seed in seed_map.get(cid, []):
+             for neighbor, sim in content_sim.get(int(seed), []):
+                 scores[neighbor] = scores.get(neighbor, 0.0) + sim
+-        top = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:k]
++        top = sorted(scores.items(), key=lambda x: (-x[1], x[0]))[:k]
+         preds[cid] = [a for a, _ in top]
+     return preds
+ 
+@@ -77,7 +129,7 @@ def build_repeat_candidates(con, cutoff: str, target_customers=None, k: int = 12
+         ),
+         ranked AS (
+             SELECT customer_idx, article_id,
+-                   ROW_NUMBER() OVER (PARTITION BY customer_idx ORDER BY last_dat DESC, freq DESC) AS rn
++                   ROW_NUMBER() OVER (PARTITION BY customer_idx ORDER BY last_dat DESC, freq DESC, article_id) AS rn
+             FROM agg
+         )
+         SELECT customer_idx, LIST(article_id ORDER BY rn) AS candidates
+@@ -97,12 +149,63 @@ def build_popularity_candidates(con, cutoff: str, window_days: int = 7, top_n: i
+         FROM trans
+         WHERE t_dat <= DATE '{cutoff}' AND t_dat > DATE '{cutoff}' - INTERVAL {window_days} DAY
+         GROUP BY article_id
+-        ORDER BY cnt DESC
++        ORDER BY cnt DESC, article_id
+         LIMIT {top_n}
+     """).df()
+     return df.article_id.tolist()
+ 
+ 
++def build_age_trend_table(con, cutoff: str, k: int = 12, window_days: int = 7, table_name: str = "_age_trend_top") -> str:
++    """年齢層別トレンド人気(H): cutoff直前window_days日間に、同じ年齢層の顧客に最も売れた上位k件。
++
++    短期トレンド仮説(ファストファッションは季節より「今この層で流行っているもの」が売れる)に基づく
++    候補ソース。全体トレンド(B)は全員に同じ12〜20件を出すが、こちらは年齢層ごとに異なる。
++    (age_bucket, article_id, rn) のテーブルを作ってテーブル名を返す。
++    """
++    con.execute(f"""
++        CREATE OR REPLACE TABLE {table_name} AS
++        SELECT age_bucket, article_id, rn
++        FROM (
++            SELECT age_bucket, article_id,
++                   ROW_NUMBER() OVER (PARTITION BY age_bucket ORDER BY cnt DESC, article_id) AS rn
++            FROM (
++                SELECT {age_bucket_sql('age')} AS age_bucket, article_id, COUNT(*) AS cnt
++                FROM trans
++                WHERE t_dat <= DATE '{cutoff}' AND t_dat > DATE '{cutoff}' - INTERVAL {window_days} DAY
++                GROUP BY 1, 2
++            )
++        )
++        WHERE rn <= {k}
++    """)
++    return table_name
++
++
++def build_age_trend_candidates(con, cutoff: str, target_customers, k: int = 12, window_days: int = 7) -> dict:
++    """年齢層別トレンド人気候補を {customer_idx: [article_id, ...]} で返す(03のような単体ソース検証用)。"""
++    ensure_cust_age(con)
++    table = build_age_trend_table(con, cutoff, k=k, window_days=window_days)
++    target_df = pd.DataFrame({"customer_idx": np.array(sorted({int(c) for c in target_customers}), dtype=np.int32)})
++    con.register("_age_targets", target_df)
++    df = con.execute(f"""
++        SELECT t.customer_idx, LIST(a.article_id ORDER BY a.rn) AS candidates
++        FROM _age_targets t
++        JOIN cust_age ca USING (customer_idx)
++        JOIN {table} a ON a.age_bucket = ca.age_bucket
++        GROUP BY t.customer_idx
++    """).df()
++    con.unregister("_age_targets")
++    return dict(zip(df.customer_idx, df.candidates))
++
++
++def age_trend_lists(con, cutoff: str, k: int = 12, window_days: int = 7) -> dict:
++    """{age_bucket: [article_id, ...]}。提出時のコールドスタート顧客向けフォールバックに使う。"""
++    table = build_age_trend_table(con, cutoff, k=k, window_days=window_days)
++    df = con.execute(f"""
++        SELECT age_bucket, LIST(article_id ORDER BY rn) AS items FROM {table} GROUP BY age_bucket
++    """).df()
++    return {int(b): [int(a) for a in items] for b, items in zip(df.age_bucket, df["items"])}
++
++
+ def build_price_band_popularity_candidates(
+     con,
+     cutoff: str,
+@@ -171,7 +274,7 @@ def build_category_color_candidates(con, cutoff: str, target_customers=None, k:
+         ),
+         ranked AS (
+             SELECT cp.customer_idx, vp.article_id,
+-                   ROW_NUMBER() OVER (PARTITION BY cp.customer_idx ORDER BY vp.cnt DESC) AS rn
++                   ROW_NUMBER() OVER (PARTITION BY cp.customer_idx ORDER BY vp.cnt DESC, vp.article_id) AS rn
+             FROM cust_products cp
+             JOIN variant_pop vp USING (product_code)
+         )
+@@ -192,7 +295,7 @@ def build_category_color_candidates(con, cutoff: str, target_customers=None, k:
+         )
+         SELECT customer_idx, section_name
+         FROM (
+-            SELECT *, ROW_NUMBER() OVER (PARTITION BY customer_idx ORDER BY cnt DESC) AS rn
++            SELECT *, ROW_NUMBER() OVER (PARTITION BY customer_idx ORDER BY cnt DESC, section_name) AS rn
+             FROM sec_cnt
+         )
+         WHERE rn = 1
+@@ -210,7 +313,7 @@ def build_category_color_candidates(con, cutoff: str, target_customers=None, k:
+             GROUP BY a.section_name, t.article_id
+         ),
+         ranked AS (
+-            SELECT *, ROW_NUMBER() OVER (PARTITION BY section_name ORDER BY cnt DESC) AS rn
++            SELECT *, ROW_NUMBER() OVER (PARTITION BY section_name ORDER BY cnt DESC, article_id) AS rn
+             FROM sec_item_cnt
+         )
+         SELECT section_name, LIST(article_id ORDER BY rn) AS item_list
+@@ -263,7 +366,7 @@ def build_item_cooccurrence_table(con, cutoff: str, top_partners_per_item: int =
+         CREATE OR REPLACE TABLE cooc_top AS
+         SELECT article_a, article_b, cnt
+         FROM (
+-            SELECT *, ROW_NUMBER() OVER (PARTITION BY article_a ORDER BY cnt DESC) AS rn
++            SELECT *, ROW_NUMBER() OVER (PARTITION BY article_a ORDER BY cnt DESC, article_b) AS rn
+             FROM cooc_raw
+         )
+         WHERE rn <= {top_partners_per_item}
+@@ -304,7 +407,7 @@ def build_cooccurrence_candidates(
+         ),
+         ranked AS (
+             SELECT customer_idx, article_id,
+-                   ROW_NUMBER() OVER (PARTITION BY customer_idx ORDER BY score DESC) AS rn
++                   ROW_NUMBER() OVER (PARTITION BY customer_idx ORDER BY score DESC, article_id) AS rn
+             FROM scored
+         )
+         SELECT customer_idx, LIST(article_id ORDER BY rn) AS candidates
+@@ -334,7 +437,9 @@ def build_cf_candidates(
+         GROUP BY customer_idx, article_id
+     """).df()
+ 
+-    item_ids = interactions["article_id"].unique()
++    # duckdbのGROUP BY結果は行順が実行ごとに変わるため、商品インデックスの採番を固定する
++    # (採番が変わるとALSの初期値の割り当てが変わり、同じrandom_stateでも結果が揺れる)
++    item_ids = np.sort(interactions["article_id"].unique())
+     item_id_to_idx = {a: i for i, a in enumerate(item_ids)}
+     idx_to_item_id = {i: a for a, i in item_id_to_idx.items()}
+     interactions["item_idx"] = interactions["article_id"].map(item_id_to_idx)
+@@ -348,8 +453,10 @@ def build_cf_candidates(
+         shape=(n_users, n_items),
+     ).tocsr()
+ 
++    # スレッド数は HM_ALS_THREADS で指定できる(既定0=全コア。商品インデックスを固定したのでスレッド数によらず再現する)
+     model = implicit.als.AlternatingLeastSquares(
+-        factors=factors, regularization=0.01, iterations=iterations, random_state=random_state
++        factors=factors, regularization=0.01, iterations=iterations, random_state=random_state,
++        num_threads=int(os.environ.get("HM_ALS_THREADS", 0)),
+     )
+     model.fit(user_items)
+ 
+@@ -376,35 +483,79 @@ DEFAULT_K_PER_SOURCE = {
+ }
+ 
+ 
+-def build_candidate_pool(con, cutoff: str, target_customers, k_per_source=None, seed_k: int = 12) -> pd.DataFrame:
+-    """6ソースを統合し、(customer_idx, article_id)ごとにどのソース由来かのフラグを持つDataFrameを返す。
++def _map_to_long(candidate_map: dict, src: int) -> pd.DataFrame:
++    """{customer_idx: [article_id, ...]} を (customer_idx, article_id, src) の縦持ちDataFrameにする。"""
++    if not candidate_map:
++        return pd.DataFrame({
++            "customer_idx": np.array([], dtype=np.int32),
++            "article_id": np.array([], dtype=np.int64),
++            "src": np.array([], dtype=np.int8),
++        })
++    n = len(candidate_map)
++    cids = np.fromiter(candidate_map.keys(), dtype=np.int64, count=n)
++    lens = np.fromiter((len(v) for v in candidate_map.values()), dtype=np.int64, count=n)
++    total = int(lens.sum())
++    arts = np.fromiter(itertools.chain.from_iterable(candidate_map.values()), dtype=np.int64, count=total)
++    return pd.DataFrame({
++        "customer_idx": np.repeat(cids, lens).astype(np.int32),
++        "article_id": arts,
++        "src": np.full(total, src, dtype=np.int8),
++    })
++
++
++def _resolve_k_map(k_per_source) -> dict:
++    if k_per_source is None:
++        return dict(DEFAULT_K_PER_SOURCE)
++    if isinstance(k_per_source, int):
++        return {name: k_per_source for name in DEFAULT_K_PER_SOURCE}
++    return {**DEFAULT_K_PER_SOURCE, **k_per_source}
+ 
+-    候補ソースG(build_price_band_popularity_candidates, H5価格帯フィルタ人気)はbacktestは改善したが
+-    実LB(Public/Private)が悪化したため不採用(00_md/pipeline_build_log.md参照)。関数自体は残す。
+ 
+-    k_per_source: ソースごとの取得件数。Noneなら DEFAULT_K_PER_SOURCE を使う
+-    (03の単体Recall@12が高かったA:自己リピート/B:トレンド人気を20件に拡張、他は12件のまま)。
+-    intを渡すと全ソース一律その件数になる(従来の挙動、後方互換用)。dictを渡すと
+-    一部のソースだけ上書きできる(未指定キーはDEFAULT_K_PER_SOURCEを使う)。
+-    seed_k: アイテム共起(E)・テキスト類似(F)のシードに使う自己リピート候補の件数。
+-    from_repeatの出力件数を広げてもシードの質は12件のまま据え置きたい場合などに、
+-    k_per_source["from_repeat"]とは独立に指定できる。
++def build_candidate_pool_table(
++    con,
++    cutoff: str,
++    target_customers,
++    k_per_source=None,
++    seed_k: int = 12,
++    extra_sources=(),
++    table_name: str = "candidate_pool",
++    verbose: bool = False,
++) -> int:
++    """候補ソースを統合した (customer_idx, article_id, from_*フラグ...) のテーブルをduckdb内に作り、行数を返す。
++
++    k_per_source / seed_k の意味は build_candidate_pool と同じ。
++    extra_sources: 既定6ソースに加えて有効化する追加ソース名のタプル。現在は "age_trend" のみ
++        (列名 from_age_trend)。既定では空で、既存モデル(0906版など)と同じ6ソースのプールになる。
+     """
+-    if k_per_source is None:
+-        k_map = dict(DEFAULT_K_PER_SOURCE)
+-    elif isinstance(k_per_source, int):
+-        k_map = {name: k_per_source for name in DEFAULT_K_PER_SOURCE}
+-    else:
+-        k_map = {**DEFAULT_K_PER_SOURCE, **k_per_source}
++    unknown = set(extra_sources) - set(EXTRA_SOURCE_COLS)
++    if unknown:
++        raise ValueError(f"未知の追加ソース: {unknown}")
++    k_map = _resolve_k_map(k_per_source)
++    src_cols = BASE_SOURCE_COLS + [EXTRA_SOURCE_COLS[s] for s in extra_sources]
++    src_code = {name: i for i, name in enumerate(src_cols)}
+ 
+-    target_customers = list({int(c) for c in target_customers})
++    target_customers = sorted({int(c) for c in target_customers})
+ 
++    def log(msg):
++        if verbose:
++            print(f"  [{cutoff}] {msg}", flush=True)
++
++    parts = []
+     repeat_map = build_repeat_candidates(con, cutoff, target_customers=target_customers, k=k_map["from_repeat"])
++    log(f"A 自己リピート: {len(repeat_map):,}顧客")
+     pop_list = build_popularity_candidates(con, cutoff, top_n=k_map["from_trend"])
++
+     category_map = build_category_color_candidates(
+         con, cutoff, target_customers=target_customers, k=k_map["from_category_color"]
+     )
++    parts.append(_map_to_long(category_map, src_code["from_category_color"]))
++    del category_map
++    log("C 同カテゴリ/同色: done")
++
+     cf_map = build_cf_candidates(con, cutoff, target_customers, k_map["from_cf"])
++    parts.append(_map_to_long(cf_map, src_code["from_cf"]))
++    del cf_map
++    log("D CF(ALS): done")
+ 
+     if seed_k == k_map["from_repeat"]:
+         seed_map = repeat_map
+@@ -414,34 +565,78 @@ def build_candidate_pool(con, cutoff: str, target_customers, k_per_source=None,
+     cooc_map = build_cooccurrence_candidates(
+         con, cutoff, target_customers, k_map["from_cooccurrence"], seed_map=seed_map
+     )
++    parts.append(_map_to_long(cooc_map, src_code["from_cooccurrence"]))
++    del cooc_map
++    con.execute("DROP TABLE IF EXISTS cooc_raw")  # 共起の中間テーブルは大きいので即解放
++    log("E 共起: done")
++
+     content_map = build_content_similarity_candidates(
+         con, cutoff, target_customers, k=k_map["from_content_similarity"], seed_map=seed_map
+     )
++    parts.append(_map_to_long(content_map, src_code["from_content_similarity"]))
++    del content_map, seed_map
++    log("F テキスト類似: done")
++
++    parts.append(_map_to_long(repeat_map, src_code["from_repeat"]))
++    del repeat_map
++
++    long_df = pd.concat(parts, ignore_index=True)
++    del parts
++    con.register("_cand_long", long_df)
++    con.register("_cand_targets", pd.DataFrame({"customer_idx": np.array(target_customers, dtype=np.int32)}))
++    con.register("_cand_pop", pd.DataFrame({"article_id": np.array(pop_list, dtype=np.int64)}))
++
++    union_sql = [
++        "SELECT customer_idx, article_id, src FROM _cand_long",
++        f"SELECT t.customer_idx, p.article_id, {src_code['from_trend']}::TINYINT AS src "
++        "FROM _cand_targets t CROSS JOIN _cand_pop p",
++    ]
++    if "age_trend" in extra_sources:
++        ensure_cust_age(con)
++        age_table = build_age_trend_table(con, cutoff, k=k_map.get("from_age_trend", 12))
++        union_sql.append(
++            f"SELECT t.customer_idx, a.article_id, {src_code['from_age_trend']}::TINYINT AS src "
++            f"FROM _cand_targets t JOIN cust_age ca USING (customer_idx) "
++            f"JOIN {age_table} a ON a.age_bucket = ca.age_bucket"
++        )
++    flags = ",\n            ".join(
++        f"MAX(CASE WHEN src = {i} THEN 1 ELSE 0 END)::TINYINT AS {name}" for i, name in enumerate(src_cols)
++    )
++    con.execute(f"""
++        CREATE OR REPLACE TABLE {table_name} AS
++        SELECT customer_idx::INTEGER AS customer_idx, article_id::BIGINT AS article_id,
++            {flags}
++        FROM ({' UNION ALL '.join(union_sql)})
++        GROUP BY 1, 2
++    """)
++    for name in ["_cand_long", "_cand_targets", "_cand_pop"]:
++        con.unregister(name)
++    del long_df
++    n_rows = con.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0]
++    log(f"候補プール: {n_rows:,}ペア")
++    return n_rows
+ 
+-    rows = {}
+-    for cid in target_customers:
+-        sources = {
+-            "from_repeat": repeat_map.get(cid, []),
+-            "from_trend": pop_list,
+-            "from_category_color": category_map.get(cid, []),
+-            "from_cf": cf_map.get(cid, []),
+-            "from_cooccurrence": cooc_map.get(cid, []),
+-            "from_content_similarity": content_map.get(cid, []),
+-        }
+-        for src_name, articles in sources.items():
+-            for article_id in articles:
+-                key = (cid, int(article_id))
+-                if key not in rows:
+-                    rows[key] = {
+-                        "customer_idx": cid,
+-                        "article_id": int(article_id),
+-                        "from_repeat": 0,
+-                        "from_trend": 0,
+-                        "from_category_color": 0,
+-                        "from_cf": 0,
+-                        "from_cooccurrence": 0,
+-                        "from_content_similarity": 0,
+-                    }
+-                rows[key][src_name] = 1
+-
+-    return pd.DataFrame(rows.values())
++
++def build_candidate_pool(con, cutoff: str, target_customers, k_per_source=None, seed_k: int = 12,
++                         extra_sources=()) -> pd.DataFrame:
++    """候補ソースを統合し、(customer_idx, article_id)ごとにどのソース由来かのフラグを持つDataFrameを返す。
++
++    候補ソースG(build_price_band_popularity_candidates, H5価格帯フィルタ人気)はbacktestは改善したが
++    実LB(Public/Private)が悪化したため不採用(00_md/pipeline_build_log.md参照)。関数自体は残す。
++
++    k_per_source: ソースごとの取得件数。Noneなら DEFAULT_K_PER_SOURCE を使う
++    (03の単体Recall@12が高かったA:自己リピート/B:トレンド人気を20件に拡張、他は12件のまま)。
++    intを渡すと全ソース一律その件数になる(従来の挙動、後方互換用)。dictを渡すと
++    一部のソースだけ上書きできる(未指定キーはDEFAULT_K_PER_SOURCEを使う)。
++    seed_k: アイテム共起(E)・テキスト類似(F)のシードに使う自己リピート候補の件数。
++    from_repeatの出力件数を広げてもシードの質は12件のまま据え置きたい場合などに、
++    k_per_source["from_repeat"]とは独立に指定できる。
++
++    実体は build_candidate_pool_table(duckdb内で統合)で、ここではそれをDataFrameとして取り出すだけ。
++    大規模データではDataFrame化せず build_candidate_pool_table を直接使うこと(features.pyはそうしている)。
++    """
++    build_candidate_pool_table(con, cutoff, target_customers, k_per_source, seed_k, extra_sources,
++                               table_name="_candidate_pool_df")
++    df = con.execute("SELECT * FROM _candidate_pool_df").df()
++    con.execute("DROP TABLE _candidate_pool_df")
++    return df
+diff --git a/Z_notebook/common.py b/Z_notebook/common.py
+index 5f71709..d3e76af 100644
+--- a/Z_notebook/common.py
++++ b/Z_notebook/common.py
+@@ -1,7 +1,12 @@
+-"""H&M コンペ用の共有ユーティリティ(バックテスト分割・評価指標・提出/実験ログ)。
++"""H&M コンペ用の共有ユーティリティ(duckdb接続・バックテスト分割・評価指標・提出/実験ログ)。
+ 
+-Z_notebook/ 配下の各ノートブックから `from common import ...` で読み込む想定。
+-候補生成・特徴量エンジニアリングそのもののロジックはここに置かず、各ノートブックに書く。
++Z_notebook/ 配下の各ノートブック・CLIから `from common import ...` で読み込む想定。
++候補生成は `candidates.py`、特徴量は `features.py` に置く。
++
++duckdbのメモリ上限・スレッド数・スピル先は環境変数で上書きできる(コードを書き換えずにMac/Colabを切り替えるため):
++    HM_DUCKDB_MEMORY  (既定 '12GB'。Colab High-RAM(51GB)なら '20GB' 程度)
++    HM_DUCKDB_THREADS (既定 4)
++    HM_DUCKDB_TMP     (既定 未設定=duckdbの既定。Colabなら '/content/duckdb_tmp' などローカルディスクを指定)
+ """
+ 
+ import os
+@@ -19,11 +24,22 @@ MODELS_DIR = os.path.join(_HERE, "..", "02_output", "models")
+ EXPERIMENT_LOG_PATH = os.path.join(_HERE, "..", "experiment_log.csv")
+ 
+ 
+-def get_con():
++def configure_con(con, memory_limit=None, threads=None, temp_dir=None):
++    """duckdb接続にメモリ上限・スレッド数・スピル先を設定する(引数 > 環境変数 > 既定値)。"""
++    memory_limit = memory_limit or os.environ.get("HM_DUCKDB_MEMORY", "12GB")
++    threads = int(threads or os.environ.get("HM_DUCKDB_THREADS", 4))
++    temp_dir = temp_dir or os.environ.get("HM_DUCKDB_TMP")
++    con.execute(f"PRAGMA threads={threads}")
++    con.execute(f"PRAGMA memory_limit='{memory_limit}'")
++    if temp_dir:
++        os.makedirs(temp_dir, exist_ok=True)
++        con.execute(f"PRAGMA temp_directory='{temp_dir}'")
++    return con
++
++
++def get_con(memory_limit=None, threads=None, temp_dir=None):
+     """trans(取引) / cust_map(customer_id<->customer_idx) / articles を使えるduckdb接続を返す。"""
+-    con = duckdb.connect()
+-    con.execute("PRAGMA threads=4")
+-    con.execute("PRAGMA memory_limit='12GB'")
++    con = configure_con(duckdb.connect(), memory_limit, threads, temp_dir)
+     con.execute(f"CREATE OR REPLACE VIEW trans AS SELECT * FROM read_parquet('{TRANS_LITE_PATH}')")
+     con.execute(f"""
+         CREATE OR REPLACE TABLE cust_map AS
+@@ -34,6 +50,45 @@ def get_con():
+     return con
+ 
+ 
++def ensure_trans_lite(verbose: bool = True) -> str:
++    """01_eda.ipynbと同じロジックで trans_lite.parquet を作る(既にあれば何もしない)。
++
++    Colabなど新しい環境で01を開かずにパイプラインを始められるようにするためのもの。
++    customer_idxの採番(ROW_NUMBER() OVER ())はget_con()のcust_mapと同一の式であること。
++    """
++    if os.path.exists(TRANS_LITE_PATH):
++        if verbose:
++            print(f"[skip] {TRANS_LITE_PATH} は既に存在します")
++        return TRANS_LITE_PATH
++    os.makedirs(os.path.dirname(TRANS_LITE_PATH), exist_ok=True)
++    con = configure_con(duckdb.connect())
++    con.execute(f"""
++        CREATE TABLE cust_map AS
++        SELECT customer_id, (ROW_NUMBER() OVER () - 1)::INTEGER AS customer_idx
++        FROM read_csv_auto('{DATA_DIR}/customers.csv')
++    """)
++    con.execute(f"""
++        COPY (
++          SELECT cm.customer_idx, t.t_dat,
++                 CAST(t.article_id AS BIGINT) AS article_id,
++                 t.price, t.sales_channel_id::TINYINT AS sales_channel_id,
++                 CAST(a.product_code AS INTEGER) AS product_code,
++                 a.product_group_name, a.index_group_name,
++                 c.age::SMALLINT AS age
++          FROM read_csv_auto('{DATA_DIR}/transactions_train.csv') t
++          JOIN cust_map cm ON cm.customer_id = t.customer_id
++          LEFT JOIN read_csv_auto('{DATA_DIR}/articles.csv') a
++            ON CAST(a.article_id AS BIGINT) = CAST(t.article_id AS BIGINT)
++          LEFT JOIN read_csv_auto('{DATA_DIR}/customers.csv') c
++            ON c.customer_id = t.customer_id
++        ) TO '{TRANS_LITE_PATH}' (FORMAT PARQUET)
++    """)
++    con.close()
++    if verbose:
++        print(f"[ok] {TRANS_LITE_PATH} を作成しました")
++    return TRANS_LITE_PATH
++
++
+ def backtest_split(con, holdout_days: int = 7):
+     """学習データ最終日から holdout_days 日分をホールドアウトし、(cutoff文字列, {customer_idx: {article_id,...}}) を返す。
+ 
+diff --git a/Z_notebook/features.py b/Z_notebook/features.py
+index 3408eeb..ab8a8a0 100644
+--- a/Z_notebook/features.py
++++ b/Z_notebook/features.py
+@@ -1,44 +1,132 @@
+ """候補×特徴量テーブル構築(04_feature_engineering.ipynbから抽出)。
+ 
+-user系・item系・user-item交差系・時間系・季節性系の特徴量を作る。05/06からも共通で使う。
+-
+-季節性特徴量(i_sales_yoy_7d/cat_sales_yoy_7d/cat_sales_recent_28d/cat_seasonal_lift)は
+-「target週(cutoff直後7日)のちょうど1年前にあたる週」の実績を使う。articleそのものは毎年
+-入れ替わる(YoYで存在しないことが多い)ため、より安定したsection_name単位でも同じ発想の
+-特徴量を用意している。行ごとに値が変わるため、学習cutoffが特定の時期(例: 8〜9月)に
+-偏っていても学習可能(target_week_start_domのような「暦上の位置そのもの」を表す特徴量は、
+-学習cutoffの時期にバリエーションがないと木が分岐できず実質無意味になる点と対照的)。
++user系・item系・user-item交差系・時間系の特徴量を作る。05/06/08/09・CLIから共通で使う。
++
++## 特徴量セット
++
++- `BASE_0906_FEATURES`: 現行ベスト(model_20260906_0924_ranker, Private LB 0.02620)が使っている35列。
++  既存の列名・定義は一切変えていない(0906版モデルでそのままスコアリングできる)。
++- `TREND_FEATURES`: 短期トレンド仮説(00_md/pipeline_build_log.md「短期トレンド仮説での再設計」節)で追加した列。
++  「ファストファッションでは季節性(前年同週)より、直近数日〜数週の流行の勢い・新しさ・同年代での流行が効く」
++  という仮説に対応する。商品の勢い(1/3/14日販売数、前週比、指数減衰スコア、購入者数、順位)、
++  新しさ(発売からの日数、ユーザーの新作志向)、値下げ(直近価格/通常価格)、年齢層内の流行
++  (同年齢層での直近7日販売数・シェア・順位)、売場(section)単位の前週比。
++- `YOY_FEATURES`: 0917版の季節性特徴量。季節横断holdoutで効果なしと判断したため既定では計算しない
++  (include_yoy=Trueで従来どおり計算できる。0917版モデルの再評価用)。
++
++既定(include_trend=False, include_yoy=False, extra_sources=())では0906版と同じ列構成になる
++(04/05/06を再実行したときの挙動を変えないため)。新しい列はrun_trend_experiment.pyなどで明示的に有効化する。
++
++## 実装方針(メモリ)
++
++全ての集計・結合・ラベル付与・型の縮小(TINYINT/INTEGER/FLOAT)をduckdb内で行い、
++`write_feature_table` はそのまま `COPY ... TO parquet` で書き出す(Python側に巨大なDataFrameを作らない)。
++以前の実装は `.df()` で文字列列をobject dtypeのまま3,000万行展開し、さらにpandasでラベルをmergeしていたため、
++ColabのHigh-RAM(51GB)でもcutoff=2020-07-28でOOM killされていた。
++`build_feature_table` は後方互換用で、同じSQLの結果をArrow経由でpandasに変換して返す。
+ """
+ 
+ import pandas as pd
+ 
+-from candidates import build_candidate_pool
+-from common import active_customers, label_window
++from candidates import (
++    BASE_SOURCE_COLS,
++    EXTRA_SOURCE_COLS,
++    age_bucket_sql,
++    build_candidate_pool_table,
++    ensure_cust_age,
++)
+ 
++CAT_COLS = ["product_group_name", "index_group_name", "section_name"]
+ 
+-def build_feature_table(
++BASE_0906_FEATURES = [
++    "from_repeat", "from_trend", "from_category_color", "from_cf", "from_cooccurrence",
++    "from_content_similarity", "n_sources",
++    "product_group_name", "index_group_name", "section_name",
++    "u_total_purchases", "u_distinct_articles", "u_distinct_product_codes", "u_avg_price", "u_price_cv",
++    "u_days_since_last_purchase", "u_online_ratio", "u_active_weeks",
++    "u_menswear_share", "u_babychildren_share", "u_ladieswear_share",
++    "u_purchases_7d", "u_purchases_28d", "u_purchases_91d",
++    "i_total_sales", "i_avg_price", "i_days_since_last_sale", "i_sales_7d", "i_sales_28d",
++    "ui_times_bought", "ui_days_since_last_bought", "ui_times_bought_product_code",
++    "ui_days_since_last_bought_product_code", "ui_price_diff",
++    "target_week_start_dom",
++]
++
++TREND_FEATURES = [
++    # 商品の勢い
++    "i_sales_1d", "i_sales_3d", "i_sales_14d", "i_sales_prev7d", "i_wow_ratio", "i_sales_decay",
++    "i_buyers_7d", "i_rank_7d",
++    # 新しさ・値下げ
++    "i_days_since_first_sale", "i_price_ratio_7d",
++    # 同年齢層での流行
++    "u_age", "ia_sales_7d", "ia_share_7d", "ia_rank_7d",
++    # 売場単位の勢い
++    "sec_sales_7d", "sec_wow_ratio",
++    # ユーザーの新作志向
++    "u_item_age_at_purchase_avg", "u_new_item_share",
++]
++
++YOY_FEATURES = ["i_sales_yoy_7d", "cat_sales_yoy_7d", "cat_sales_recent_28d", "cat_seasonal_lift"]
++
++
++def _d(cutoff: str, days: int = 0) -> str:
++    """cutoffからdays日前の日付を表すSQL式。"""
++    return f"DATE '{cutoff}'" if days == 0 else f"(DATE '{cutoff}' - INTERVAL {days} DAY)"
++
++
++def prepare_feature_query(
+     con,
+     cutoff: str,
+     label_days: int = 7,
+     trailing_days: int = 56,
+     k_per_source=None,
+     with_label: bool = True,
+-) -> pd.DataFrame:
+-    target_customers = set(active_customers(con, cutoff, trailing_days))
+-    label_map = None
+-    if with_label:
+-        label_map = label_window(con, cutoff, label_days)
+-        target_customers |= set(label_map.keys())
++    extra_sources=(),
++    include_trend: bool = False,
++    include_yoy: bool = False,
++    verbose: bool = True,
++) -> str:
++    """候補プールと各特徴量テーブルをduckdb内に作り、最終テーブルを返すSELECT文を返す。"""
++    c = cutoff
++
++    # --- 対象顧客: cutoff以前trailing_days日以内の購入者 ∪ (学習時は)ラベル期間の購入者 ---
++    label_customers_sql = (
++        f"UNION SELECT DISTINCT customer_idx FROM trans "
++        f"WHERE t_dat > {_d(c)} AND t_dat <= {_d(c)} + INTERVAL {label_days} DAY"
++        if with_label else ""
++    )
++    con.execute(f"""
++        CREATE OR REPLACE TABLE _targets AS
++        SELECT DISTINCT customer_idx FROM trans
++        WHERE t_dat <= {_d(c)} AND t_dat > {_d(c, trailing_days)}
++        {label_customers_sql}
++    """)
++    target_customers = con.execute("SELECT customer_idx FROM _targets").fetchnumpy()["customer_idx"].tolist()
++    if verbose:
++        print(f"  [{c}] 対象顧客数: {len(target_customers):,}", flush=True)
+ 
+-    print(f"  [{cutoff}] 対象顧客数: {len(target_customers):,}")
++    n_pairs = build_candidate_pool_table(
++        con, c, target_customers, k_per_source, extra_sources=extra_sources, verbose=verbose,
++    )
++    del target_customers, n_pairs
++    con.execute("CREATE OR REPLACE TABLE _pool_customers AS SELECT DISTINCT customer_idx FROM candidate_pool")
+ 
+-    candidate_pool = build_candidate_pool(con, cutoff, target_customers, k_per_source)
+-    print(f"  [{cutoff}] 候補ペア数: {len(candidate_pool):,}")
+-    con.register("candidate_pool", candidate_pool)
++    if with_label:
++        con.execute(f"""
++            CREATE OR REPLACE TABLE _labels AS
++            SELECT DISTINCT customer_idx, article_id FROM trans
++            WHERE t_dat > {_d(c)} AND t_dat <= {_d(c)} + INTERVAL {label_days} DAY
++        """)
+ 
++    pool_filter = "customer_idx IN (SELECT customer_idx FROM _pool_customers)"
++
++    # --- user系(候補プールに登場する顧客だけ集計する) ---
+     con.execute(f"""
+         CREATE OR REPLACE TABLE user_feat AS
+-        WITH base AS (
++        WITH ut AS (
++            SELECT * FROM trans WHERE t_dat <= {_d(c)} AND {pool_filter}
++        ),
++        base AS (
+             SELECT customer_idx,
+                    COUNT(*) AS u_total_purchases,
+                    COUNT(DISTINCT article_id) AS u_distinct_articles,
+@@ -50,189 +138,313 @@ def build_feature_table(
+                    COUNT(DISTINCT DATE_TRUNC('week', t_dat)) AS u_active_weeks,
+                    AVG(CASE WHEN index_group_name = 'Menswear' THEN 1.0 ELSE 0.0 END) AS u_menswear_share,
+                    AVG(CASE WHEN index_group_name = 'Baby/Children' THEN 1.0 ELSE 0.0 END) AS u_babychildren_share,
+-                   AVG(CASE WHEN index_group_name = 'Ladieswear' THEN 1.0 ELSE 0.0 END) AS u_ladieswear_share
+-            FROM trans
+-            WHERE t_dat <= DATE '{cutoff}'
+-            GROUP BY customer_idx
+-        ),
+-        recent7 AS (
+-            SELECT customer_idx, COUNT(*) AS u_purchases_7d
+-            FROM trans
+-            WHERE t_dat <= DATE '{cutoff}' AND t_dat > DATE '{cutoff}' - INTERVAL 7 DAY
+-            GROUP BY customer_idx
+-        ),
+-        recent28 AS (
+-            SELECT customer_idx, COUNT(*) AS u_purchases_28d
+-            FROM trans
+-            WHERE t_dat <= DATE '{cutoff}' AND t_dat > DATE '{cutoff}' - INTERVAL 28 DAY
+-            GROUP BY customer_idx
+-        ),
+-        recent91 AS (
+-            SELECT customer_idx, COUNT(*) AS u_purchases_91d
+-            FROM trans
+-            WHERE t_dat <= DATE '{cutoff}' AND t_dat > DATE '{cutoff}' - INTERVAL 91 DAY
++                   AVG(CASE WHEN index_group_name = 'Ladieswear' THEN 1.0 ELSE 0.0 END) AS u_ladieswear_share,
++                   COUNT(*) FILTER (WHERE t_dat > {_d(c, 7)}) AS u_purchases_7d,
++                   COUNT(*) FILTER (WHERE t_dat > {_d(c, 28)}) AS u_purchases_28d,
++                   COUNT(*) FILTER (WHERE t_dat > {_d(c, 91)}) AS u_purchases_91d
++            FROM ut
+             GROUP BY customer_idx
+         )
+-
+-        SELECT b.customer_idx, b.u_total_purchases, b.u_distinct_articles, b.u_distinct_product_codes,
+-               b.u_avg_price, b.u_price_cv,
+-               DATE_DIFF('day', b.u_last_purchase_dat, DATE '{cutoff}') AS u_days_since_last_purchase,
+-               b.u_online_ratio, b.u_active_weeks,
+-               b.u_menswear_share, b.u_babychildren_share, b.u_ladieswear_share,
+-               COALESCE(r7.u_purchases_7d, 0) AS u_purchases_7d,
+-               COALESCE(r28.u_purchases_28d, 0) AS u_purchases_28d,
+-               COALESCE(r91.u_purchases_91d, 0) AS u_purchases_91d
++        SELECT b.* EXCLUDE (u_last_purchase_dat),
++               DATE_DIFF('day', b.u_last_purchase_dat, {_d(c)}) AS u_days_since_last_purchase
+         FROM base b
+-        LEFT JOIN recent7 r7 USING (customer_idx)
+-        LEFT JOIN recent28 r28 USING (customer_idx)
+-        LEFT JOIN recent91 r91 USING (customer_idx)
+     """)
+ 
++    # --- item系(全商品) ---
++    yoy_cte = f""",
++        yoy AS (
++            -- target週(cutoff, cutoff+7]のちょうど1年前にあたる週の売上(0917版の季節性特徴量)
++            SELECT article_id, COUNT(*) AS i_sales_yoy_7d
++            FROM trans
++            WHERE t_dat > {_d(c, 365)} AND t_dat <= {_d(c, 358)}
++            GROUP BY article_id
++        )""" if include_yoy else ""
+     con.execute(f"""
+         CREATE OR REPLACE TABLE item_feat AS
+         WITH base AS (
+             SELECT article_id,
+                    COUNT(*) AS i_total_sales,
+                    AVG(price) AS i_avg_price,
+-                   MAX(t_dat) AS i_last_sale_dat
+-            FROM trans
+-            WHERE t_dat <= DATE '{cutoff}'
+-            GROUP BY article_id
+-        ),
+-        recent7 AS (
+-            SELECT article_id, COUNT(*) AS i_sales_7d
++                   MAX(t_dat) AS i_last_sale_dat,
++                   MIN(t_dat) AS i_first_sale_dat
+             FROM trans
+-            WHERE t_dat <= DATE '{cutoff}' AND t_dat > DATE '{cutoff}' - INTERVAL 7 DAY
++            WHERE t_dat <= {_d(c)}
+             GROUP BY article_id
+         ),
+-        recent28 AS (
+-            SELECT article_id, COUNT(*) AS i_sales_28d
+-            FROM trans
+-            WHERE t_dat <= DATE '{cutoff}' AND t_dat > DATE '{cutoff}' - INTERVAL 28 DAY
+-            GROUP BY article_id
+-        ),
+-        yoy AS (
+-            -- target週(cutoff, cutoff+7]のちょうど1年前にあたる週の売上。季節性シグナル。
+-            SELECT article_id, COUNT(*) AS i_sales_yoy_7d
++        recent AS (
++            SELECT article_id,
++                   COUNT(*) FILTER (WHERE t_dat > {_d(c, 1)}) AS i_sales_1d,
++                   COUNT(*) FILTER (WHERE t_dat > {_d(c, 3)}) AS i_sales_3d,
++                   COUNT(*) FILTER (WHERE t_dat > {_d(c, 7)}) AS i_sales_7d,
++                   COUNT(*) FILTER (WHERE t_dat <= {_d(c, 7)} AND t_dat > {_d(c, 14)}) AS i_sales_prev7d,
++                   COUNT(*) FILTER (WHERE t_dat > {_d(c, 14)}) AS i_sales_14d,
++                   COUNT(*) AS i_sales_28d,
++                   COUNT(DISTINCT customer_idx) FILTER (WHERE t_dat > {_d(c, 7)}) AS i_buyers_7d,
++                   SUM(EXP(-DATE_DIFF('day', t_dat, {_d(c)}) / 7.0)) AS i_sales_decay,
++                   AVG(price) FILTER (WHERE t_dat > {_d(c, 7)}) AS i_avg_price_7d
+             FROM trans
+-            WHERE t_dat > DATE '{cutoff}' - INTERVAL 365 DAY AND t_dat <= DATE '{cutoff}' - INTERVAL 358 DAY
++            WHERE t_dat <= {_d(c)} AND t_dat > {_d(c, 28)}
+             GROUP BY article_id
+-        )
++        ){yoy_cte}
+         SELECT b.article_id, b.i_total_sales, b.i_avg_price,
+-               DATE_DIFF('day', b.i_last_sale_dat, DATE '{cutoff}') AS i_days_since_last_sale,
+-               COALESCE(r7.i_sales_7d, 0) AS i_sales_7d,
+-               COALESCE(r28.i_sales_28d, 0) AS i_sales_28d,
+-               COALESCE(y.i_sales_yoy_7d, 0) AS i_sales_yoy_7d
++               DATE_DIFF('day', b.i_last_sale_dat, {_d(c)}) AS i_days_since_last_sale,
++               -- データ開始日(2018-09-20)より前の発売日は観測できないため365日で頭打ちにする
++               -- (cutoffが2019年だと最大約366日、2020年だと約700日になり、時期によって分布がずれるのを防ぐ)
++               LEAST(DATE_DIFF('day', b.i_first_sale_dat, {_d(c)}), 365) AS i_days_since_first_sale,
++               COALESCE(r.i_sales_1d, 0) AS i_sales_1d,
++               COALESCE(r.i_sales_3d, 0) AS i_sales_3d,
++               COALESCE(r.i_sales_7d, 0) AS i_sales_7d,
++               COALESCE(r.i_sales_prev7d, 0) AS i_sales_prev7d,
++               COALESCE(r.i_sales_14d, 0) AS i_sales_14d,
++               COALESCE(r.i_sales_28d, 0) AS i_sales_28d,
++               COALESCE(r.i_buyers_7d, 0) AS i_buyers_7d,
++               COALESCE(r.i_sales_decay, 0) AS i_sales_decay,
++               (COALESCE(r.i_sales_7d, 0) + 1.0) / (COALESCE(r.i_sales_prev7d, 0) + 1.0) AS i_wow_ratio,
++               r.i_avg_price_7d / NULLIF(b.i_avg_price, 0) AS i_price_ratio_7d,
++               CASE WHEN COALESCE(r.i_sales_7d, 0) > 0
++                    THEN RANK() OVER (ORDER BY COALESCE(r.i_sales_7d, 0) DESC) END AS i_rank_7d
++               {', COALESCE(y.i_sales_yoy_7d, 0) AS i_sales_yoy_7d' if include_yoy else ''}
+         FROM base b
+-        LEFT JOIN recent7 r7 USING (article_id)
+-        LEFT JOIN recent28 r28 USING (article_id)
+-        LEFT JOIN yoy y USING (article_id)
++        LEFT JOIN recent r USING (article_id)
++        {'LEFT JOIN yoy y USING (article_id)' if include_yoy else ''}
+     """)
+ 
+-    con.execute(f"""
+-        CREATE OR REPLACE TABLE cat_feat AS
+-        WITH yoy AS (
+-            -- section_name単位。articleそのものは毎年入れ替わるが部門(section)は安定して存在するため、
+-            -- 個々のarticleがまだ存在しなかった年でも「このカテゴリは今の時期に売れるか」を測れる。
+-            SELECT a.section_name, COUNT(*) AS cnt
+-            FROM trans t JOIN articles a ON a.article_id = t.article_id
+-            WHERE t.t_dat > DATE '{cutoff}' - INTERVAL 365 DAY AND t.t_dat <= DATE '{cutoff}' - INTERVAL 358 DAY
+-            GROUP BY a.section_name
+-        ),
+-        recent AS (
+-            SELECT a.section_name, COUNT(*) AS cnt
+-            FROM trans t JOIN articles a ON a.article_id = t.article_id
+-            WHERE t.t_dat <= DATE '{cutoff}' AND t.t_dat > DATE '{cutoff}' - INTERVAL 28 DAY
++    trend_selects = ""
++    trend_joins = ""
++    if include_trend:
++        ensure_cust_age(con)
++        # 同年齢層での直近7日の流行
++        con.execute(f"""
++            CREATE OR REPLACE TABLE ia_feat AS
++            SELECT age_bucket, article_id, ia_sales_7d,
++                   ia_sales_7d * 1.0 / SUM(ia_sales_7d) OVER (PARTITION BY age_bucket) AS ia_share_7d,
++                   RANK() OVER (PARTITION BY age_bucket ORDER BY ia_sales_7d DESC) AS ia_rank_7d
++            FROM (
++                SELECT {age_bucket_sql('age')} AS age_bucket, article_id, COUNT(*) AS ia_sales_7d
++                FROM trans
++                WHERE t_dat <= {_d(c)} AND t_dat > {_d(c, 7)}
++                GROUP BY 1, 2
++            )
++        """)
++        # 売場(section)単位の前週比
++        con.execute(f"""
++            CREATE OR REPLACE TABLE sec_feat AS
++            SELECT a.section_name,
++                   COUNT(*) FILTER (WHERE t.t_dat > {_d(c, 7)}) AS sec_sales_7d,
++                   COUNT(*) FILTER (WHERE t.t_dat <= {_d(c, 7)}) AS sec_sales_prev7d
++            FROM trans t
++            JOIN articles a ON a.article_id = t.article_id
++            WHERE t.t_dat <= {_d(c)} AND t.t_dat > {_d(c, 14)}
+             GROUP BY a.section_name
+-        )
+-        SELECT COALESCE(y.section_name, r.section_name) AS section_name,
+-               COALESCE(y.cnt, 0) AS cat_sales_yoy_7d,
+-               COALESCE(r.cnt, 0) AS cat_sales_recent_28d
+-        FROM yoy y
+-        FULL OUTER JOIN recent r USING (section_name)
+-    """)
++        """)
++        # ユーザーの新作志向: 直近91日に買った商品が、その時点で発売から何日目だったか
++        con.execute(f"""
++            CREATE OR REPLACE TABLE user_trend_feat AS
++            WITH first_sale AS (
++                SELECT article_id, MIN(t_dat) AS first_dat FROM trans WHERE t_dat <= {_d(c)} GROUP BY article_id
++            )
++            SELECT t.customer_idx,
++                   AVG(LEAST(DATE_DIFF('day', f.first_dat, t.t_dat), 365)) AS u_item_age_at_purchase_avg,
++                   AVG(CASE WHEN DATE_DIFF('day', f.first_dat, t.t_dat) <= 14 THEN 1.0 ELSE 0.0 END)
++                       AS u_new_item_share
++            FROM trans t
++            JOIN first_sale f USING (article_id)
++            WHERE t.t_dat <= {_d(c)} AND t.t_dat > {_d(c, 91)} AND t.{pool_filter}
++            GROUP BY t.customer_idx
++        """)
++        trend_selects = """,
++            COALESCE(itf.i_sales_1d, 0)::INTEGER AS i_sales_1d,
++            COALESCE(itf.i_sales_3d, 0)::INTEGER AS i_sales_3d,
++            COALESCE(itf.i_sales_14d, 0)::INTEGER AS i_sales_14d,
++            COALESCE(itf.i_sales_prev7d, 0)::INTEGER AS i_sales_prev7d,
++            COALESCE(itf.i_wow_ratio, 1.0)::FLOAT AS i_wow_ratio,
++            COALESCE(itf.i_sales_decay, 0)::FLOAT AS i_sales_decay,
++            COALESCE(itf.i_buyers_7d, 0)::INTEGER AS i_buyers_7d,
++            itf.i_rank_7d::FLOAT AS i_rank_7d,
++            itf.i_days_since_first_sale::FLOAT AS i_days_since_first_sale,
++            itf.i_price_ratio_7d::FLOAT AS i_price_ratio_7d,
++            ca.age::FLOAT AS u_age,
++            COALESCE(ia.ia_sales_7d, 0)::INTEGER AS ia_sales_7d,
++            COALESCE(ia.ia_share_7d, 0)::FLOAT AS ia_share_7d,
++            ia.ia_rank_7d::FLOAT AS ia_rank_7d,
++            COALESCE(sf.sec_sales_7d, 0)::INTEGER AS sec_sales_7d,
++            ((COALESCE(sf.sec_sales_7d, 0) + 1.0) / (COALESCE(sf.sec_sales_prev7d, 0) + 1.0))::FLOAT AS sec_wow_ratio,
++            utf.u_item_age_at_purchase_avg::FLOAT AS u_item_age_at_purchase_avg,
++            utf.u_new_item_share::FLOAT AS u_new_item_share"""
++        trend_joins = """
++        LEFT JOIN cust_age ca ON ca.customer_idx = cp.customer_idx
++        LEFT JOIN ia_feat ia ON ia.age_bucket = ca.age_bucket AND ia.article_id = cp.article_id
++        LEFT JOIN sec_feat sf ON sf.section_name = a.section_name
++        LEFT JOIN user_trend_feat utf ON utf.customer_idx = cp.customer_idx"""
++
++    yoy_selects = ""
++    yoy_joins = ""
++    if include_yoy:
++        con.execute(f"""
++            CREATE OR REPLACE TABLE cat_feat AS
++            WITH yoy AS (
++                SELECT a.section_name, COUNT(*) AS cnt
++                FROM trans t JOIN articles a ON a.article_id = t.article_id
++                WHERE t.t_dat > {_d(c, 365)} AND t.t_dat <= {_d(c, 358)}
++                GROUP BY a.section_name
++            ),
++            recent AS (
++                SELECT a.section_name, COUNT(*) AS cnt
++                FROM trans t JOIN articles a ON a.article_id = t.article_id
++                WHERE t.t_dat <= {_d(c)} AND t.t_dat > {_d(c, 28)}
++                GROUP BY a.section_name
++            )
++            SELECT COALESCE(y.section_name, r.section_name) AS section_name,
++                   COALESCE(y.cnt, 0) AS cat_sales_yoy_7d,
++                   COALESCE(r.cnt, 0) AS cat_sales_recent_28d
++            FROM yoy y
++            FULL OUTER JOIN recent r USING (section_name)
++        """)
++        yoy_selects = """,
++            COALESCE(itf.i_sales_yoy_7d, 0)::INTEGER AS i_sales_yoy_7d,
++            COALESCE(cf.cat_sales_yoy_7d, 0)::INTEGER AS cat_sales_yoy_7d,
++            COALESCE(cf.cat_sales_recent_28d, 0)::INTEGER AS cat_sales_recent_28d,
++            (COALESCE(cf.cat_sales_yoy_7d, 0) / NULLIF(COALESCE(cf.cat_sales_recent_28d, 0) / 4.0, 0))::FLOAT
++                AS cat_seasonal_lift"""
++        yoy_joins = "\n        LEFT JOIN cat_feat cf ON cf.section_name = a.section_name"
+ 
++    # --- user-item交差系(候補プールに登場する顧客だけ) ---
+     con.execute(f"""
+         CREATE OR REPLACE TABLE ui_feat AS
+         SELECT customer_idx, article_id,
+                COUNT(*) AS ui_times_bought,
+-               DATE_DIFF('day', MAX(t_dat), DATE '{cutoff}') AS ui_days_since_last_bought
++               DATE_DIFF('day', MAX(t_dat), {_d(c)}) AS ui_days_since_last_bought
+         FROM trans
+-        WHERE t_dat <= DATE '{cutoff}'
++        WHERE t_dat <= {_d(c)} AND {pool_filter}
+         GROUP BY customer_idx, article_id
+     """)
+-
+     con.execute(f"""
+         CREATE OR REPLACE TABLE ui_product_feat AS
+         SELECT customer_idx, product_code,
+                COUNT(*) AS ui_times_bought_product_code,
+-               DATE_DIFF('day', MAX(t_dat), DATE '{cutoff}') AS ui_days_since_last_bought_product_code
++               DATE_DIFF('day', MAX(t_dat), {_d(c)}) AS ui_days_since_last_bought_product_code
+         FROM trans
+-        WHERE t_dat <= DATE '{cutoff}'
++        WHERE t_dat <= {_d(c)} AND {pool_filter}
+         GROUP BY customer_idx, product_code
+     """)
+ 
+-    target_week_start_dom = (pd.Timestamp(cutoff) + pd.Timedelta(days=1)).day
++    target_week_start_dom = (pd.Timestamp(c) + pd.Timedelta(days=1)).day
++    extra_flag_selects = "".join(
++        f",\n            cp.{EXTRA_SOURCE_COLS[s]}" for s in extra_sources
++    )
++    label_select = ",\n            COALESCE(lb.label, 0)::TINYINT AS label" if with_label else ""
++    label_join = (
++        "\n        LEFT JOIN (SELECT customer_idx, article_id, 1 AS label FROM _labels) lb"
++        "\n            ON lb.customer_idx = cp.customer_idx AND lb.article_id = cp.article_id"
++        if with_label else ""
++    )
++    n_sources_expr = " + ".join(f"cp.{s}" for s in BASE_SOURCE_COLS)
+ 
+-    feature_df = con.execute(f"""
++    return f"""
+         SELECT
+-            cp.customer_idx, cp.article_id,
++            cp.customer_idx::INTEGER AS customer_idx,
++            cp.article_id::INTEGER AS article_id,
+             cp.from_repeat, cp.from_trend, cp.from_category_color, cp.from_cf, cp.from_cooccurrence,
+-            cp.from_content_similarity,
+-            (cp.from_repeat + cp.from_trend + cp.from_category_color + cp.from_cf + cp.from_cooccurrence
+-             + cp.from_content_similarity) AS n_sources,
+-
+-            a.product_code, a.product_group_name, a.index_group_name, a.section_name,
+-
+-            COALESCE(uf.u_total_purchases, 0) AS u_total_purchases,
+-            COALESCE(uf.u_distinct_articles, 0) AS u_distinct_articles,
+-            COALESCE(uf.u_distinct_product_codes, 0) AS u_distinct_product_codes,
+-            uf.u_avg_price,
+-            uf.u_price_cv,
+-            uf.u_days_since_last_purchase,
+-            uf.u_online_ratio,
+-            COALESCE(uf.u_active_weeks, 0) AS u_active_weeks,
+-            uf.u_menswear_share, uf.u_babychildren_share, uf.u_ladieswear_share,
+-            COALESCE(uf.u_purchases_7d, 0) AS u_purchases_7d,
+-            COALESCE(uf.u_purchases_28d, 0) AS u_purchases_28d,
+-            COALESCE(uf.u_purchases_91d, 0) AS u_purchases_91d,
+-
+-            COALESCE(itf.i_total_sales, 0) AS i_total_sales,
+-            itf.i_avg_price,
+-            COALESCE(itf.i_days_since_last_sale, 9999) AS i_days_since_last_sale,
+-            COALESCE(itf.i_sales_7d, 0) AS i_sales_7d,
+-            COALESCE(itf.i_sales_28d, 0) AS i_sales_28d,
+-            COALESCE(itf.i_sales_yoy_7d, 0) AS i_sales_yoy_7d,
+-
+-            COALESCE(uif.ui_times_bought, 0) AS ui_times_bought,
+-            uif.ui_days_since_last_bought,
+-            COALESCE(upf.ui_times_bought_product_code, 0) AS ui_times_bought_product_code,
+-            upf.ui_days_since_last_bought_product_code,
+-            (itf.i_avg_price - uf.u_avg_price) AS ui_price_diff,
+-
+-            COALESCE(cf.cat_sales_yoy_7d, 0) AS cat_sales_yoy_7d,
+-            COALESCE(cf.cat_sales_recent_28d, 0) AS cat_sales_recent_28d,
+-            COALESCE(cf.cat_sales_yoy_7d, 0) / NULLIF(COALESCE(cf.cat_sales_recent_28d, 0) / 4.0, 0)
+-                AS cat_seasonal_lift,
+-
+-            {target_week_start_dom} AS target_week_start_dom
++            cp.from_content_similarity{extra_flag_selects},
++            ({n_sources_expr})::TINYINT AS n_sources,
++
++            a.product_code::INTEGER AS product_code,
++            a.product_group_name, a.index_group_name, a.section_name,
++
++            COALESCE(uf.u_total_purchases, 0)::INTEGER AS u_total_purchases,
++            COALESCE(uf.u_distinct_articles, 0)::INTEGER AS u_distinct_articles,
++            COALESCE(uf.u_distinct_product_codes, 0)::INTEGER AS u_distinct_product_codes,
++            uf.u_avg_price::FLOAT AS u_avg_price,
++            uf.u_price_cv::FLOAT AS u_price_cv,
++            uf.u_days_since_last_purchase::FLOAT AS u_days_since_last_purchase,
++            uf.u_online_ratio::FLOAT AS u_online_ratio,
++            COALESCE(uf.u_active_weeks, 0)::INTEGER AS u_active_weeks,
++            uf.u_menswear_share::FLOAT AS u_menswear_share,
++            uf.u_babychildren_share::FLOAT AS u_babychildren_share,
++            uf.u_ladieswear_share::FLOAT AS u_ladieswear_share,
++            COALESCE(uf.u_purchases_7d, 0)::INTEGER AS u_purchases_7d,
++            COALESCE(uf.u_purchases_28d, 0)::INTEGER AS u_purchases_28d,
++            COALESCE(uf.u_purchases_91d, 0)::INTEGER AS u_purchases_91d,
++
++            COALESCE(itf.i_total_sales, 0)::INTEGER AS i_total_sales,
++            itf.i_avg_price::FLOAT AS i_avg_price,
++            COALESCE(itf.i_days_since_last_sale, 9999)::INTEGER AS i_days_since_last_sale,
++            COALESCE(itf.i_sales_7d, 0)::INTEGER AS i_sales_7d,
++            COALESCE(itf.i_sales_28d, 0)::INTEGER AS i_sales_28d,
++
++            COALESCE(uif.ui_times_bought, 0)::INTEGER AS ui_times_bought,
++            uif.ui_days_since_last_bought::FLOAT AS ui_days_since_last_bought,
++            COALESCE(upf.ui_times_bought_product_code, 0)::INTEGER AS ui_times_bought_product_code,
++            upf.ui_days_since_last_bought_product_code::FLOAT AS ui_days_since_last_bought_product_code,
++            (itf.i_avg_price - uf.u_avg_price)::FLOAT AS ui_price_diff,
++
++            {target_week_start_dom}::INTEGER AS target_week_start_dom{trend_selects}{yoy_selects}{label_select},
++            '{c}' AS cutoff
+         FROM candidate_pool cp
+         LEFT JOIN articles a ON a.article_id = cp.article_id
+         LEFT JOIN user_feat uf ON uf.customer_idx = cp.customer_idx
+         LEFT JOIN item_feat itf ON itf.article_id = cp.article_id
+         LEFT JOIN ui_feat uif ON uif.customer_idx = cp.customer_idx AND uif.article_id = cp.article_id
+         LEFT JOIN ui_product_feat upf
+-            ON upf.customer_idx = cp.customer_idx AND upf.product_code = a.product_code
+-        LEFT JOIN cat_feat cf ON cf.section_name = a.section_name
+-    """).df()
++            ON upf.customer_idx = cp.customer_idx AND upf.product_code = a.product_code{trend_joins}{yoy_joins}{label_join}
++    """
+ 
+-    if with_label:
+-        label_rows = [(cid, int(aid)) for cid, articles in label_map.items() for aid in articles]
+-        label_df = pd.DataFrame(label_rows, columns=["customer_idx", "article_id"])
+-        label_df["label"] = 1
+-        feature_df = feature_df.merge(label_df, on=["customer_idx", "article_id"], how="left")
+-        feature_df["label"] = feature_df["label"].fillna(0).astype(int)
+-
+-    feature_df["cutoff"] = cutoff
+-    con.unregister("candidate_pool")
+-    return feature_df
++
++def _cleanup(con) -> None:
++    for t in ["candidate_pool", "_pool_customers", "_labels", "_targets", "user_feat", "item_feat", "ia_feat",
++              "sec_feat", "user_trend_feat", "cat_feat", "ui_feat", "ui_product_feat", "cooc_top", "cooc_raw",
++              "_age_trend_top"]:
++        con.execute(f"DROP TABLE IF EXISTS {t}")
++
++
++def _to_arrow_table(con, sql: str):
++    res = con.execute(sql)
++    if hasattr(res, "to_arrow_table"):  # duckdb >= 1.4
++        return res.to_arrow_table()
++    return res.fetch_arrow_table()
++
++
++def write_feature_table(con, cutoff: str, out_path: str, **kwargs) -> int:
++    """1cutoff分の候補×特徴量(×ラベル)テーブルを、Pythonを経由せずparquetに直接書き出して行数を返す。
++
++    kwargs は prepare_feature_query と同じ(label_days, trailing_days, k_per_source, with_label,
++    extra_sources, include_trend, include_yoy, verbose)。行順は保証しない(使う側でソートする)。
++    """
++    sql = prepare_feature_query(con, cutoff, **kwargs)
++    # 行順は不要(読み込み側で並べ替える)。全体ソートや挿入順の保持をしないことでメモリとスピルを減らす
++    con.execute("SET preserve_insertion_order = false")
++    con.execute(f"COPY ({sql}) TO '{out_path}' (FORMAT PARQUET, COMPRESSION ZSTD)")
++    con.execute("SET preserve_insertion_order = true")
++    n_rows = con.execute(f"SELECT COUNT(*) FROM read_parquet('{out_path}')").fetchone()[0]
++    _cleanup(con)
++    return n_rows
++
++
++def build_feature_table(
++    con,
++    cutoff: str,
++    label_days: int = 7,
++    trailing_days: int = 56,
++    k_per_source=None,
++    with_label: bool = True,
++    extra_sources=(),
++    include_trend: bool = False,
++    include_yoy: bool = False,
++    verbose: bool = True,
++) -> pd.DataFrame:
++    """後方互換用: 同じテーブルをpandas DataFrame(カテゴリ列はcategory dtype)で返す。
++
++    0906版モデル(BASE_0906_FEATURES)は追加列を無視するのでそのままスコアリングできる。
++    0917版モデルを再評価する場合は include_yoy=True を渡すこと。
++    大規模データでは write_feature_table でparquetに書き出してから必要な列だけ読む方が安全。
++    """
++    sql = prepare_feature_query(
++        con, cutoff, label_days=label_days, trailing_days=trailing_days, k_per_source=k_per_source,
++        with_label=with_label, extra_sources=extra_sources, include_trend=include_trend,
++        include_yoy=include_yoy, verbose=verbose,
++    )
++    table = _to_arrow_table(con, sql)
++    _cleanup(con)
++    df = table.to_pandas(categories=CAT_COLS)
++    del table
++    return df
+diff --git a/Z_notebook/multi_week_eval.py b/Z_notebook/multi_week_eval.py
+index ee8e309..f98a9f8 100644
+--- a/Z_notebook/multi_week_eval.py
++++ b/Z_notebook/multi_week_eval.py
+@@ -16,7 +16,7 @@ import pickle
+ import pandas as pd
+ 
+ from common import label_window
+-from features import build_feature_table
++from features import TREND_FEATURES, YOY_FEATURES, build_feature_table
+ 
+ NULLABLE_INT_COLS = [
+     "u_days_since_last_purchase",
+@@ -25,6 +25,20 @@ NULLABLE_INT_COLS = [
+ ]
+ 
+ 
++def _table_options(feature_col_lists) -> dict:
++    """評価対象モデルが使う列から、特徴量テーブルに必要なオプションを決める。
++
++    features.pyは2026-09-21以降、YoY(0917版)・短期トレンド列・年齢層別トレンド候補を既定では作らないため、
++    それらを使うモデルを採点するときだけ自動で有効化する(08で0917版を再評価しても列不足にならないように)。
++    """
++    cols = set().union(*[set(c) for c in feature_col_lists])
++    return {
++        "include_yoy": bool(cols & set(YOY_FEATURES)),
++        "include_trend": bool(cols & set(TREND_FEATURES)),
++        "extra_sources": ("age_trend",) if "from_age_trend" in cols else (),
++    }
++
++
+ def holdout_cutoffs(con, n_weeks: int = 4, min_gap_days: int = 42, step_days: int = 7) -> list:
+     """データ最終日から min_gap_days 日以上遡った週次cutoffを n_weeks 個返す。
+ 
+@@ -71,7 +85,7 @@ def score_model_at_cutoff(
+ 
+     df = build_feature_table(
+         con, cutoff, label_days=label_days, trailing_days=trailing_days,
+-        k_per_source=k_per_source, with_label=True,
++        k_per_source=k_per_source, with_label=True, **_table_options([feature_cols]),
+     )
+     actual_map = label_window(con, cutoff, label_days)
+ 
+@@ -138,6 +152,7 @@ def group_score_at_cutoff(
+     df = build_feature_table(
+         con, cutoff, label_days=label_days, trailing_days=trailing_days,
+         k_per_source=k_per_source, with_label=True,
++        **_table_options([payload["feature_cols"] for _, payload, _ in models]),
+     )
+     actual_map = label_window(con, cutoff, label_days)
+ 
+diff --git a/Z_notebook/run_trend_experiment.py b/Z_notebook/run_trend_experiment.py
+new file mode 100644
+index 0000000..527ad13
+--- /dev/null
++++ b/Z_notebook/run_trend_experiment.py
+@@ -0,0 +1,569 @@
++"""短期トレンド仮説の検証パイプライン(CLI)。Mac(ローカル)でもGoogle Colabでも同じコマンドで動く。
++
++仮説: ファストファッションでは季節性(前年同週)より、直近数日〜数週の流行の勢い・新しさ・同年代での流行が
++購買を決める(季節横断holdoutで0917版のYoY特徴量に効果がなかったこと、上位解法の多くが直近1〜6週の
++情報だけで組まれていたことが根拠。00_md/pipeline_build_log.md「短期トレンド仮説での再設計」節参照)。
++
++手順(各ステップは途中で落ちても、再実行すれば終わったところから再開する):
++
++    python run_trend_experiment.py build   [--only val,train1,...] # 週ごとの特徴量テーブル(サブプロセス)
++    python run_trend_experiment.py train   [--variants ...]        # 3条件を同じプロトコルで学習・評価
++    python run_trend_experiment.py report                          # 週別MAP@12・ブートストラップ信頼区間
++    python run_trend_experiment.py refit   --variant trend_full    # 提出用に直近4週で学習し直す
++    python run_trend_experiment.py predict --variant trend_full    # 提出ファイル作成
++
++共通オプション:
++    --work-dir   作業ディレクトリ(既定: 02_output/experiments/trend。Colabなら /content/hm_work 推奨)
++    --sync-dir   小さい成果物(モデル・結果・提出ファイル・ログ)をコピーする先(ColabならGoogle Drive)
++"""
++
++import argparse
++import glob
++import json
++import os
++import shutil
++import subprocess
++import sys
++import time
++from datetime import datetime
++
++os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
++
++import numpy as np  # noqa: E402
++import pandas as pd  # noqa: E402
++
++HERE = os.path.dirname(os.path.abspath(__file__))
++sys.path.insert(0, HERE)
++
++from common import (  # noqa: E402
++    MODELS_DIR, SUBMISSION_DIR, append_experiment_log, format_prediction, get_con, label_window,
++)
++from features import TREND_FEATURES  # noqa: E402
++import train_protocol as tp  # noqa: E402
++
++DEFAULT_WORK_DIR = os.path.join(HERE, "..", "02_output", "experiments", "trend")
++TRAIN_WEEKS = ["train2", "train3", "train4"]
++STOP_WEEK = "train1"
++REPORT_WEEKS_FIXED = ["val"]
++# 季節の異なる追加の報告週(任意)。前回の季節横断検証(Claude Project「パイプライン最新ステータス」11節)と同じ日付から、
++# 実テストと同季節の1年前(秋)・年末商戦(冬)・COVID後の回復期(夏)を選ぶ。短期トレンド特徴量は前年同週を参照しないので
++# 2019-09-13より前という制約はない。学習週(2020年8〜9月)より前なのでラベルの重なりもない。
++SEASON_WEEKS = {"season1": "2019-09-21", "season2": "2019-12-21", "season3": "2020-06-20"}
++BUILD_FLAGS = ["--trend", "--extra-sources", "age_trend"]
++
++
++# ---------------------------------------------------------------------------
++# 共通
++# ---------------------------------------------------------------------------
++
++def log(msg: str) -> None:
++    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
++
++
++def md_table(df: pd.DataFrame, index: bool = True) -> str:
++    """tabulateに依存しない簡易Markdown表(Mac/Colabどちらでも追加インストール不要にするため)。"""
++    d = df.reset_index() if index else df
++    def fmt(v):
++        if isinstance(v, float):
++            return "" if v != v else f"{v:.6g}"
++        return str(v)
++    header = "| " + " | ".join(str(c) for c in d.columns) + " |"
++    sep = "|" + "|".join("---" for _ in d.columns) + "|"
++    body = ["| " + " | ".join(fmt(v) for v in row) + " |" for row in d.itertuples(index=False)]
++    return "\n".join([header, sep] + body)
++
++
++def paths(work_dir: str) -> dict:
++    p = {
++        "root": work_dir,
++        "features": os.path.join(work_dir, "features"),
++        "models": os.path.join(work_dir, "models"),
++        "results": os.path.join(work_dir, "results"),
++        "submission": os.path.join(work_dir, "submission"),
++        "manifest": os.path.join(work_dir, "manifest.json"),
++    }
++    for k, v in p.items():
++        if k != "manifest":
++            os.makedirs(v, exist_ok=True)
++    return p
++
++
++def load_manifest(p: dict, holdout_weeks: int = 3) -> dict:
++    """週の構成(cutoff)を決めて保存する。一度決めたら再実行しても変えない。"""
++    if os.path.exists(p["manifest"]):
++        with open(p["manifest"]) as f:
++            return json.load(f)
++    con = get_con()
++    max_dat = con.execute("SELECT MAX(t_dat) FROM trans").fetchone()[0]
++    con.close()
++
++    def day(n):
++        return (pd.Timestamp(max_dat) - pd.Timedelta(days=n)).strftime("%Y-%m-%d")
++
++    weeks = {"val": day(7), "train1": day(14), "train2": day(21), "train3": day(28), "train4": day(35)}
++    # multi_week_eval.holdout_cutoffs と同じ週(最終日-42/-49/-56日)。どの学習週のラベル期間とも重ならない
++    for i in range(holdout_weeks):
++        weeks[f"holdout{i + 1}"] = day(42 + 7 * i)
++    weeks.update(SEASON_WEEKS)
++    manifest = {"max_dat": pd.Timestamp(max_dat).strftime("%Y-%m-%d"), "final": pd.Timestamp(max_dat).strftime("%Y-%m-%d"),
++                "weeks": weeks, "created": datetime.now().isoformat(timespec="seconds")}
++    with open(p["manifest"], "w") as f:
++        json.dump(manifest, f, indent=2, ensure_ascii=False)
++    return manifest
++
++
++def week_path(p: dict, name: str, cutoff: str) -> str:
++    return os.path.join(p["features"], f"{name}_{cutoff}.parquet")
++
++
++def report_weeks(manifest: dict) -> list:
++    extra = sorted(w for w in manifest["weeks"] if w.startswith("holdout"))
++    extra += sorted(w for w in manifest["weeks"] if w.startswith("season"))
++    return REPORT_WEEKS_FIXED + extra
++
++
++def sync(p: dict, sync_dir) -> None:
++    """モデル・結果・提出ファイル・manifestだけを同期する(特徴量parquetは大きいので同期しない)。"""
++    if not sync_dir:
++        return
++    for sub in ["models", "results", "submission"]:
++        src = p[sub]
++        dst = os.path.join(sync_dir, sub)
++        os.makedirs(dst, exist_ok=True)
++        for f in glob.glob(os.path.join(src, "*")):
++            target = os.path.join(dst, os.path.basename(f))
++            if not os.path.exists(target) or os.path.getmtime(f) > os.path.getmtime(target):
++                shutil.copy2(f, target)
++    shutil.copy2(p["manifest"], os.path.join(sync_dir, "manifest.json"))
++    log(f"同期しました -> {sync_dir}")
++
++
++def run_build_subprocess(name: str, cutoff: str, out: str, with_label: bool = True) -> None:
++    cmd = [sys.executable, os.path.join(HERE, "build_one_cutoff.py"), "--name", name, "--cutoff", cutoff,
++           "--out", out] + BUILD_FLAGS + ([] if with_label else ["--no-label"])
++    t0 = time.time()
++    result = subprocess.run(cmd, cwd=HERE)
++    if result.returncode != 0:
++        hint = ""
++        if result.returncode in (-9, 137):
++            hint = (" → OSにSIGKILLされました(メモリ不足の可能性が高い)。HM_DUCKDB_MEMORYを下げるか、"
++                    "High-RAMランタイムを使ってください")
++        raise RuntimeError(f"{name}(cutoff={cutoff})の構築に失敗しました returncode={result.returncode}{hint}")
++    log(f"{name} 完了 ({(time.time() - t0) / 60:.1f}分)")
++
++
++# ---------------------------------------------------------------------------
++# build
++# ---------------------------------------------------------------------------
++
++def cmd_build(args) -> None:
++    p = paths(args.work_dir)
++    manifest = load_manifest(p, args.holdout_weeks)
++    # 既定ではseason週(任意の追加評価)は作らない。作る場合は --only season1,season2,season3
++    names = args.only.split(",") if args.only else [w for w in manifest["weeks"] if not w.startswith("season")]
++    for name in names:
++        cutoff = manifest["weeks"][name]
++        out = week_path(p, name, cutoff)
++        if os.path.exists(out):
++            log(f"[skip] {name} ({cutoff}) は作成済み")
++            continue
++        log(f"=== {name} (cutoff={cutoff}) を構築 ===")
++        run_build_subprocess(name, cutoff, out)
++    sync(p, args.sync_dir)
++
++
++# ---------------------------------------------------------------------------
++# train
++# ---------------------------------------------------------------------------
++
++def week_context(p: dict, name: str, cutoff: str, con) -> dict:
++    """評価週ごとの正解・アクティブ顧客・年齢層・フォールバック用リスト(提出時と同じ作り方)をキャッシュする。"""
++    cache = os.path.join(p["features"], f"context_{name}.pkl")
++    if os.path.exists(cache):
++        return pd.read_pickle(cache)
++    from candidates import ensure_cust_age
++    from common import active_customers
++    actual = label_window(con, cutoff, 7)
++    active = active_customers(con, cutoff, 56)
++    ensure_cust_age(con)
++    con.register("_ctx_customers", pd.DataFrame({"customer_idx": np.array(list(actual.keys()), dtype=np.int32)}))
++    bdf = con.execute("SELECT customer_idx, age_bucket FROM cust_age JOIN _ctx_customers USING (customer_idx)").df()
++    con.unregister("_ctx_customers")
++    age_top, global_top = tp.fallback_lists(con, cutoff)
++    ctx = {"actual": actual, "active": {int(c) for c in active},
++           "buckets": {int(c): (int(b) if b == b else -1) for c, b in zip(bdf.customer_idx, bdf.age_bucket)},
++           "age_top": age_top, "global_top": global_top}
++    pd.to_pickle(ctx, cache)
++    return ctx
++
++
++COLD_START_MODES = {"global": "", "age_trend": "+agecold"}
++
++
++def clear_cached_scores(p: dict, label: str) -> None:
++    """モデルを作り直したときに、古いモデルで計算した顧客別APのキャッシュを消す(レポートに新旧が混ざらないように)。"""
++    for suffix in COLD_START_MODES.values():
++        for f in glob.glob(os.path.join(p["results"], f"ap_{label}{suffix}_*.npy")):
++            os.remove(f)
++
++
++def evaluate_payload(p: dict, manifest: dict, label: str, payload: dict, vocab: dict, con) -> list:
++    """報告週ごとに、提出ファイルと同じ作り方の予測でMAP@12を出す(フォールバック2通り)。
++
++    label        : 従来どおり全体人気でフォールバック(06と同じ)。モデル同士の比較はこちらで行う
++    label+agecold: コールドスタートを同年齢層の直近人気にした場合(コールドスタート部分の効果を見る)
++    """
++    rows = []
++    for name in report_weeks(manifest):
++        cutoff = manifest["weeks"][name]
++        path = week_path(p, name, cutoff)
++        if not os.path.exists(path):
++            log(f"  [{label}] {name}: 特徴量テーブルが無いのでスキップ")
++            continue
++        ap_paths = {mode: os.path.join(p["results"], f"ap_{label}{suffix}_{name}.npy")
++                    for mode, suffix in COLD_START_MODES.items()}
++        if not all(os.path.exists(x) for x in ap_paths.values()):
++            ctx = week_context(p, name, cutoff, con)
++            model_map = tp.top_k_map(tp.score_week(path, payload, vocab))
++            for mode, ap_path in ap_paths.items():
++                customers, ap = tp.submission_like_ap(ctx["actual"], model_map, ctx["active"], ctx["buckets"],
++                                                      ctx["age_top"], ctx["global_top"], cold_start=mode)
++                np.save(ap_path, ap)
++            cust_path = os.path.join(p["results"], f"customers_{name}.npy")
++            if not os.path.exists(cust_path):
++                np.save(cust_path, customers)
++        for mode, suffix in COLD_START_MODES.items():
++            ap = np.load(ap_paths[mode])
++            rows.append({"variant": f"{label}{suffix}", "week": name, "cutoff": cutoff,
++                         "map12": float(ap.mean()), "n_customers": len(ap)})
++        log(f"  [{label}] {name} ({cutoff}) MAP@12={rows[-2]['map12']:.5f} "
++            f"(コールドスタートを年齢層人気にすると {rows[-1]['map12']:.5f}, n={rows[-1]['n_customers']:,})")
++    return rows
++
++
++def _write_scores(p: dict, rows: list) -> None:
++    path = os.path.join(p["results"], "scores.csv")
++    new = pd.DataFrame(rows)
++    if os.path.exists(path):
++        old = pd.read_csv(path)
++        old = old[~old.set_index(["variant", "week"]).index.isin(new.set_index(["variant", "week"]).index)]
++        new = pd.concat([old, new], ignore_index=True)
++    new.sort_values(["variant", "week"]).to_csv(path, index=False)
++
++
++def cmd_train(args) -> None:
++    p = paths(args.work_dir)
++    manifest = load_manifest(p)
++    weeks = manifest["weeks"]
++    for name in TRAIN_WEEKS + [STOP_WEEK, "val"]:
++        if not os.path.exists(week_path(p, name, weeks[name])):
++            raise FileNotFoundError(f"{name}の特徴量テーブルがありません。先に build を実行してください")
++    vocab = tp.category_vocab()
++    con = get_con()
++
++    for variant in args.variants.split(","):
++        spec = tp.VARIANTS[variant]
++        model_path = os.path.join(p["models"], f"{variant}.pkl")
++        if os.path.exists(model_path):
++            log(f"[skip] {variant} は学習済み({model_path})。評価だけ行います")
++            payload = tp.load_payload(model_path)
++        else:
++            log(f"=== {variant}: 学習 (pool={spec['pool']}, 特徴量{len(spec['features'])}列) ===")
++            clear_cached_scores(p, variant)
++            t0 = time.time()
++            train_df = tp.load_training_frame(
++                [week_path(p, w, weeks[w]) for w in TRAIN_WEEKS], spec["features"], spec["pool"], vocab,
++                neg_frac=args.neg_frac, seed=42,
++            )
++            stop_df = tp.load_training_frame(
++                [week_path(p, STOP_WEEK, weeks[STOP_WEEK])], spec["features"], spec["pool"], vocab,
++                neg_frac=0.0, seed=0, positive_only=True,
++            )
++            log(f"  学習行数 {len(train_df):,} / early stopping用 {len(stop_df):,}")
++            model, best_iter = tp.fit_ranker(train_df, spec["features"], eval_df=stop_df)
++            del train_df, stop_df
++            payload = dict(model=model, feature_cols=spec["features"], cat_cols=[c for c in tp.CAT_COLS],
++                           categories=vocab, pool=spec["pool"], variant=variant, best_iter=best_iter,
++                           trained_on=[weeks[w] for w in TRAIN_WEEKS], early_stop_week=weeks[STOP_WEEK],
++                           protocol="train2-4 / early stop train1 / report val+holdout")
++            tp.save_payload(model_path, **payload)
++            tp.feature_importance(model, spec["features"]).to_csv(
++                os.path.join(p["results"], f"importance_{variant}.csv"), index=False)
++            log(f"  学習完了 best_iter={best_iter} ({(time.time() - t0) / 60:.1f}分)")
++
++        rows = evaluate_payload(p, manifest, variant, payload, vocab, con)
++        _write_scores(p, rows)
++        val_row = [r for r in rows if r["week"] == "val"]
++        if val_row and not args.no_log:
++            ts = datetime.now().strftime("%Y%m%d_%H%M")
++            append_experiment_log(
++                run_id=f"run_{ts}_trend_{variant}", timestamp=ts, notebook="run_trend_experiment.py",
++                description=f"短期トレンド仮説 variant={variant} (pool={spec['pool']})",
++                features=", ".join(spec["features"]),
++                params=f"{tp.LGBM_PARAMS}, best_iter={payload['best_iter']}, neg_frac={args.neg_frac}",
++                cv_score=round(val_row[0]["map12"], 5), public_lb="", submission_file="",
++                model_file=os.path.basename(model_path),
++                notes="train2-4で学習/train1でearly stopping/valは報告専用(05の楽観バイアスなし)",
++            )
++        sync(p, args.sync_dir)
++    con.close()
++    cmd_report(args)
++
++
++def cmd_score_ref(args) -> None:
++    """既存モデル(例: 0906版pickle + train_categories)を同じ週で採点し、report に並べる。"""
++    p = paths(args.work_dir)
++    manifest = load_manifest(p)
++    vocab = tp.category_vocab()
++    raw = tp.load_payload(args.model)
++    with open(args.categories, "rb") as f:
++        train_categories = __import__("pickle").load(f)
++    # 旧モデルは学習時のカテゴリ語彙(コード対応)で学習しているので、その語彙で符号化する
++    ref_vocab = dict(vocab)
++    for c, cats in train_categories.items():
++        ref_vocab[c] = list(cats)
++    payload = dict(model=raw["model"], feature_cols=raw["feature_cols"], pool="base", best_iter=None)
++    clear_cached_scores(p, args.label)
++    con = get_con()
++    rows = evaluate_payload(p, manifest, args.label, payload, ref_vocab, con)
++    _write_scores(p, rows)
++    con.close()
++    cmd_report(args)
++
++
++# ---------------------------------------------------------------------------
++# report
++# ---------------------------------------------------------------------------
++
++def cmd_report(args) -> None:
++    p = paths(args.work_dir)
++    manifest = load_manifest(p)
++    scores_path = os.path.join(p["results"], "scores.csv")
++    if not os.path.exists(scores_path):
++        log("まだ結果がありません")
++        return
++    scores = pd.read_csv(scores_path)
++    weeks = [w for w in report_weeks(manifest) if w in set(scores["week"])]
++    pivot = scores.pivot(index="week", columns="variant", values="map12").reindex(weeks)
++    lines = ["# 短期トレンド仮説 検証レポート", "",
++             f"作成: {datetime.now().isoformat(timespec='minutes')} / データ最終日: {manifest['max_dat']}", "",
++             "プロトコル: train2〜4で学習、train1でearly stopping、val・holdout・seasonは報告専用(学習にも停止判定にも不使用)。",
++             "MAP@12は提出ファイルと同じ作り方で計算: 直近56日アクティブな顧客はモデル上位12件、それ以外はフォールバック。",
++             "列名の `+agecold` はフォールバックを「同年齢層の直近人気」にした場合(無印は従来どおり全体人気)。",
++             "", "## 週別 MAP@12", "", md_table(pivot.round(5)), ""]
++    lines += ["平均: " + ", ".join(f"{c}={pivot[c].mean():.5f}" for c in pivot.columns), ""]
++
++    comparisons = []
++    if "base" in pivot.columns:
++        for variant in [c for c in pivot.columns if c != "base"]:
++            diffs = []
++            for w in weeks:
++                a_path = os.path.join(p["results"], f"ap_base_{w}.npy")
++                b_path = os.path.join(p["results"], f"ap_{variant}_{w}.npy")
++                if os.path.exists(a_path) and os.path.exists(b_path):
++                    d = np.load(b_path) - np.load(a_path)
++                    stat = tp.paired_bootstrap(d, seed=1)
++                    comparisons.append({"variant": variant, "week": w, **stat})
++                    diffs.append(d)
++            if diffs:
++                pooled = tp.paired_bootstrap(np.concatenate(diffs), seed=2)
++                n_win = sum(1 for w in weeks if pivot.loc[w, variant] > pivot.loc[w, "base"])
++                comparisons.append({"variant": variant, "week": "ALL(pooled)", **pooled,
++                                    "weeks_better": f"{n_win}/{len(weeks)}"})
++    if comparisons:
++        comp = pd.DataFrame(comparisons)
++        comp.to_csv(os.path.join(p["results"], "bootstrap.csv"), index=False)
++        lines += ["## base(0906と同じ列・プール)との差: 顧客単位ペアブートストラップ(2000回)", "",
++                  md_table(comp.round(6), index=False), "",
++                  "判定の目安: pooledの95%CI下限 > 0 かつ 4分の3以上の週で改善 → 採用候補 / CIが0をまたぐ → ノイズと区別できない / "
++                  "CI上限 < 0 → 悪化。",
++                  "注意: pooledのCIは顧客だけをリサンプリングしており週ごとの揺れを含まないので狭めに出る。"
++                  "週ごとの勝敗(weeks_better)と各週のCIも必ず合わせて見ること。", ""]
++        for variant in comp["variant"].unique():
++            row = comp[(comp.variant == variant) & (comp.week == "ALL(pooled)")]
++            if row.empty:
++                continue
++            r = row.iloc[0]
++            n_win, n_weeks = (int(x) for x in str(r.get("weeks_better", "0/1")).split("/"))
++            if r.ci_low > 0 and n_win >= int(np.ceil(0.75 * n_weeks)):
++                verdict = "採用候補(差がノイズの範囲を超えて改善し、週ごとにも一貫)"
++            elif r.ci_low > 0:
++                verdict = "判断保留(平均では改善だが週ごとに一貫しない)"
++            elif r.ci_high < 0:
++                verdict = "悪化"
++            else:
++                verdict = "判断保留(差がノイズの範囲内)"
++            lines.append(f"- **{variant}**: {verdict} (平均差 {r.mean_diff:+.5f}, 95%CI [{r.ci_low:+.5f}, {r.ci_high:+.5f}], "
++                         f"改善した週 {r.get('weeks_better', '-')})")
++        lines.append("")
++
++    for variant in ["trend_feat", "trend_full"]:
++        imp_path = os.path.join(p["results"], f"importance_{variant}.csv")
++        if os.path.exists(imp_path):
++            imp = pd.read_csv(imp_path)
++            imp["rank"] = np.arange(1, len(imp) + 1)
++            imp["is_trend"] = imp["feature"].isin(TREND_FEATURES + ["from_age_trend"])
++            share = imp.loc[imp.is_trend, "gain"].sum() / max(imp["gain"].sum(), 1e-12)
++            lines += [f"## 特徴量重要度(gain) {variant}: トレンド系の合計シェア {share:.1%}", "",
++                      md_table(imp.head(20)[["rank", "feature", "gain", "is_trend"]].round(1), index=False), ""]
++
++    report = "\n".join(lines)
++    with open(os.path.join(p["results"], "report.md"), "w") as f:
++        f.write(report)
++    print(report)
++    sync(p, getattr(args, "sync_dir", None))
++
++
++# ---------------------------------------------------------------------------
++# refit / predict
++# ---------------------------------------------------------------------------
++
++def cmd_refit(args) -> None:
++    """提出用: 評価で決めた木の本数(best_iter)を固定し、最新の4週で学習し直す(early stoppingなし)。
++
++    短期トレンド仮説のもとでは直近の週ほど情報価値が高いので、評価時は報告専用だったval週も学習に入れる。
++    """
++    p = paths(args.work_dir)
++    manifest = load_manifest(p)
++    weeks = manifest["weeks"]
++    base_payload = tp.load_payload(os.path.join(p["models"], f"{args.variant}.pkl"))
++    spec = tp.VARIANTS[args.variant]
++    refit_weeks = args.weeks.split(",")
++    vocab = tp.category_vocab()
++    log(f"=== refit {args.variant}: weeks={refit_weeks}, n_estimators={base_payload['best_iter']} ===")
++    train_df = tp.load_training_frame([week_path(p, w, weeks[w]) for w in refit_weeks], spec["features"],
++                                      spec["pool"], vocab, neg_frac=args.neg_frac, seed=7)
++    log(f"  学習行数 {len(train_df):,}")
++    model, _ = tp.fit_ranker(train_df, spec["features"], n_estimators=base_payload["best_iter"])
++    ts = datetime.now().strftime("%Y%m%d_%H%M")
++    out = os.path.join(p["models"], f"{args.variant}_refit.pkl")
++    payload = dict(model=model, feature_cols=spec["features"], cat_cols=list(tp.CAT_COLS), categories=vocab,
++                   pool=spec["pool"], variant=args.variant, best_iter=base_payload["best_iter"],
++                   trained_on=[weeks[w] for w in refit_weeks], protocol="refit for submission")
++    tp.save_payload(out, **payload)
++    os.makedirs(MODELS_DIR, exist_ok=True)
++    shutil.copy2(out, os.path.join(MODELS_DIR, f"model_{ts}_trend_{args.variant}_ranker.pkl"))
++    log(f"保存しました: {out}")
++    sync(p, args.sync_dir)
++
++
++def cmd_predict(args) -> None:
++    p = paths(args.work_dir)
++    manifest = load_manifest(p)
++    final_cutoff = manifest["final"]
++    model_path = args.model or os.path.join(p["models"], f"{args.variant}_refit.pkl")
++    payload = tp.load_payload(model_path)
++    vocab = payload.get("categories") or tp.category_vocab()
++
++    final_path = week_path(p, "final", final_cutoff)
++    if not os.path.exists(final_path):
++        log(f"=== 提出用テーブル(cutoff={final_cutoff}, ラベルなし)を構築 ===")
++        run_build_subprocess("final", final_cutoff, final_path, with_label=False)
++
++    log("スコアリング中...")
++    pred_map = tp.top_k_map(tp.score_week(final_path, payload, vocab))
++    log(f"Ranker予測を持つ顧客: {len(pred_map):,}")
++
++    from candidates import age_trend_lists, build_popularity_candidates, ensure_cust_age
++    con = get_con()
++    ensure_cust_age(con)
++    global_top = build_popularity_candidates(con, final_cutoff, top_n=12)
++    age_top = age_trend_lists(con, final_cutoff, k=12) if args.cold_start == "age_trend" else {}
++    customers = con.execute("""
++        SELECT cm.customer_id, cm.customer_idx, ca.age_bucket
++        FROM cust_map cm LEFT JOIN cust_age ca USING (customer_idx)
++        ORDER BY cm.customer_idx
++    """).df()
++    con.close()
++
++    buckets = customers["age_bucket"].fillna(-1).astype(int).to_numpy()
++    preds = [tp.fill_to_k(pred_map.get(int(c), []), age_top.get(int(b), []), global_top)
++             for c, b in zip(customers["customer_idx"].to_numpy(), buckets)]
++    customers["prediction"] = [format_prediction(x) for x in preds]
++    n_cold = sum(1 for c in customers["customer_idx"] if int(c) not in pred_map)
++    log(f"コールドスタート顧客: {n_cold:,}人 → {args.cold_start} でフォールバック")
++
++    assert customers["prediction"].str.split().str.len().eq(12).all(), "12件に満たない顧客がいます"
++    sample_path = os.path.join(HERE, "..", "01_input", "sample_submission.csv")
++    if os.path.exists(sample_path):
++        sample_ids = pd.read_csv(sample_path, usecols=["customer_id"])["customer_id"]
++        assert set(sample_ids) == set(customers["customer_id"]), "sample_submission.csvの顧客と一致しません"
++        log("フォーマット検証OK(sample_submission.csvと顧客集合が一致)")
++    else:
++        log("注意: sample_submission.csv が無いので顧客集合の検証をスキップしました")
++
++    scores_path = os.path.join(p["results"], "scores.csv")
++    cv = np.nan
++    if os.path.exists(scores_path):
++        s = pd.read_csv(scores_path)
++        label = payload["variant"] + COLD_START_MODES[args.cold_start]
++        hit = s[(s.variant == label) & (s.week == "val")]
++        cv = float(hit["map12"].iloc[0]) if len(hit) else np.nan
++    ts = datetime.now().strftime("%Y%m%d_%H%M")
++    fname = f"submission_{ts}_cv{cv:.4f}.csv"
++    out = os.path.join(p["submission"], fname)
++    customers[["customer_id", "prediction"]].to_csv(out, index=False)
++    os.makedirs(SUBMISSION_DIR, exist_ok=True)
++    shutil.copy2(out, os.path.join(SUBMISSION_DIR, fname))
++    log(f"保存しました: {out}")
++    if not args.no_log:
++        append_experiment_log(
++            run_id=f"run_{ts}_trend_{payload['variant']}_submit", timestamp=ts, notebook="run_trend_experiment.py",
++            description=f"短期トレンド仮説 {payload['variant']} refit + cold_start={args.cold_start}",
++            features=", ".join(payload["feature_cols"]), params=f"best_iter={payload['best_iter']}",
++            cv_score=round(cv, 5) if cv == cv else "", public_lb="", submission_file=fname,
++            model_file=os.path.basename(model_path), notes=f"trained_on={payload.get('trained_on')}",
++        )
++    print(f"\nKaggleへの提出:\n  kaggle competitions submit -c h-and-m-personalized-fashion-recommendations "
++          f"-f {out} -m \"trend {payload['variant']} cold_start={args.cold_start}\"")
++    sync(p, args.sync_dir)
++
++
++# ---------------------------------------------------------------------------
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
++    parser.add_argument("--work-dir", default=os.environ.get("HM_WORK_DIR", DEFAULT_WORK_DIR))
++    parser.add_argument("--sync-dir", default=os.environ.get("HM_SYNC_DIR"))
++    sub = parser.add_subparsers(dest="cmd", required=True)
++
++    b = sub.add_parser("build")
++    b.add_argument("--holdout-weeks", type=int, default=3, help="初回のみ有効(manifest作成時に週構成を固定)")
++    b.add_argument("--only", default="", help="カンマ区切りの週名だけ作る(例: val,train1)")
++    b.set_defaults(func=cmd_build)
++
++    t = sub.add_parser("train")
++    t.add_argument("--variants", default="base,trend_feat,trend_full")
++    t.add_argument("--neg-frac", type=float, default=0.15)
++    t.add_argument("--no-log", action="store_true", help="experiment_log.csvに書かない")
++    t.set_defaults(func=cmd_train)
++
++    r = sub.add_parser("report")
++    r.set_defaults(func=cmd_report)
++
++    s = sub.add_parser("score-ref")
++    s.add_argument("--model", required=True)
++    s.add_argument("--categories", required=True, help="local_extract_categories.pyで作ったtrain_categories_*.pkl")
++    s.add_argument("--label", default="ref_0906")
++    s.set_defaults(func=cmd_score_ref)
++
++    f = sub.add_parser("refit")
++    f.add_argument("--variant", required=True, choices=list(tp.VARIANTS))
++    f.add_argument("--weeks", default="val,train1,train2,train3")
++    f.add_argument("--neg-frac", type=float, default=0.15)
++    f.set_defaults(func=cmd_refit)
++
++    pr = sub.add_parser("predict")
++    pr.add_argument("--variant", default="trend_full", choices=list(tp.VARIANTS))
++    pr.add_argument("--model", default=None, help="省略時は <work-dir>/models/<variant>_refit.pkl")
++    pr.add_argument("--cold-start", default="age_trend", choices=["age_trend", "global"])
++    pr.add_argument("--no-log", action="store_true")
++    pr.set_defaults(func=cmd_predict)
++
++    args = parser.parse_args()
++    args.work_dir = os.path.abspath(args.work_dir)
++    args.func(args)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/Z_notebook/train_protocol.py b/Z_notebook/train_protocol.py
+new file mode 100644
+index 0000000..b02b36f
+--- /dev/null
++++ b/Z_notebook/train_protocol.py
+@@ -0,0 +1,259 @@
++"""短期トレンド仮説の検証用: 独立評価を守った学習・評価プロトコル(run_trend_experiment.pyから使う)。
++
++## 05_train_lgbm.ipynb からの変更点(評価の独立性)
++
++05は「valでearly stoppingを掛け、同じvalでMAP@12を報告」していたため、報告値に楽観バイアスがあった
++(00_md/pipeline_build_log.md 8節の注記)。ここでは役割を完全に分ける:
++
++| 週 | 役割 |
++|---|---|
++| train2〜train4 | 学習 |
++| train1 | early stoppingの基準のみ(学習にもMAP報告にも使わない) |
++| val | MAP@12の報告のみ(学習にもearly stoppingにも一切使わない) |
++| holdout1〜3 | 追加の報告週(学習期間より前の週。週ごとのばらつきを見る) |
++
++## 比較の設計(1回の特徴量構築で段階的なablationを取る)
++
++特徴量テーブルは「全列+追加候補ソース込み」で1回だけ作り、読み込み時に列と行を絞って3条件を作る:
++
++- base: 0906版と同じ35列・6ソースのプール(n_sources > 0 の行)。同じプロトコルで学習し直した対照群
++- trend_feat: base + 短期トレンド特徴量(プールは同じ) → 特徴量だけの効果
++- trend_full: trend_feat + 年齢層別トレンド候補(from_age_trend) → 候補追加の効果
++
++base/trend_featは学習行・評価行が完全に同一なので、差はそのまま「特徴量の効果」になる。
++さらに顧客単位のAPの差をブートストラップして、差がノイズの範囲かどうかを信頼区間で判断する
++(これまでのLB上の差は±0.0002程度で、ノイズと区別がつかないことが多かったため)。
++"""
++
++import os
++import pickle
++
++import lightgbm as lgb
++import numpy as np
++import pandas as pd
++import pyarrow as pa
++import pyarrow.dataset as ds
++
++from common import DATA_DIR, apk
++from features import BASE_0906_FEATURES, CAT_COLS, TREND_FEATURES
++
++VARIANTS = {
++    "base": {"pool": "base", "features": list(BASE_0906_FEATURES)},
++    "trend_feat": {"pool": "base", "features": list(BASE_0906_FEATURES) + list(TREND_FEATURES)},
++    "trend_full": {"pool": "full", "features": list(BASE_0906_FEATURES) + list(TREND_FEATURES) + ["from_age_trend"]},
++}
++
++# 05_train_lgbm.ipynb と同じハイパーパラメータ(比較条件を揃えるため変えない)
++LGBM_PARAMS = dict(
++    objective="lambdarank",
++    n_estimators=300,
++    num_leaves=63,
++    learning_rate=0.05,
++    random_state=42,
++    verbosity=-1,
++)
++EARLY_STOPPING_ROUNDS = 30
++KEY_COLS = ["customer_idx", "article_id"]
++
++
++def category_vocab() -> dict:
++    """カテゴリ列の語彙をarticles.csvから固定する(ファイルごとに辞書順が変わる問題を根本的に避ける)。"""
++    articles = pd.read_csv(os.path.join(DATA_DIR, "articles.csv"), usecols=CAT_COLS, dtype=str)
++    return {c: sorted(articles[c].dropna().unique().tolist()) for c in CAT_COLS}
++
++
++def _pool_filter(pool: str):
++    if pool == "base":
++        return ds.field("n_sources") > 0
++    if pool == "full":
++        return None
++    raise ValueError(pool)
++
++
++def _and(a, b):
++    if a is None:
++        return b
++    if b is None:
++        return a
++    return a & b
++
++
++def _to_pandas(table: pa.Table, vocab: dict) -> pd.DataFrame:
++    df = table.to_pandas()
++    for c in CAT_COLS:
++        if c in df.columns:
++            df[c] = pd.Categorical(df[c].astype(object), categories=vocab[c])
++    return df
++
++
++def read_week(path: str, columns: list, pool: str, vocab: dict, customers=None) -> pd.DataFrame:
++    """1週分の特徴量parquetから、必要な列・プール・顧客だけを読み込む(全列の生読み込みをしない)。"""
++    dataset = ds.dataset(path, format="parquet")
++    cols = list(dict.fromkeys(KEY_COLS + list(columns)))
++    filt = _pool_filter(pool)
++    if customers is not None:
++        filt = _and(filt, ds.field("customer_idx").isin(pa.array(np.asarray(customers, dtype=np.int32))))
++    return _to_pandas(dataset.to_table(columns=cols, filter=filt), vocab)
++
++
++def sample_groups(path: str, pool: str, neg_frac: float, seed: int, positive_only: bool = False) -> np.ndarray:
++    """正解を含む顧客は全員、正解を含まない顧客はneg_fracの割合だけ残す(グループ単位の負例サンプリング)。"""
++    dataset = ds.dataset(path, format="parquet")
++    t = dataset.to_table(columns=["customer_idx", "label"], filter=_pool_filter(pool))
++    lab = pd.DataFrame({"customer_idx": t["customer_idx"].to_numpy(), "label": t["label"].to_numpy()})
++    pos = np.unique(lab.loc[lab["label"] == 1, "customer_idx"].to_numpy())
++    if positive_only:
++        return pos
++    neg = np.setdiff1d(np.unique(lab["customer_idx"].to_numpy()), pos)
++    rng = np.random.default_rng(seed)
++    keep_neg = rng.choice(neg, size=int(len(neg) * neg_frac), replace=False) if len(neg) else neg
++    return np.concatenate([pos, keep_neg])
++
++
++def load_training_frame(paths: list, feature_cols: list, pool: str, vocab: dict, neg_frac: float,
++                        seed: int = 42, positive_only: bool = False) -> pd.DataFrame:
++    frames = []
++    for i, p in enumerate(paths):
++        keep = sample_groups(p, pool, neg_frac, seed + i, positive_only=positive_only)
++        frames.append(read_week(p, feature_cols + ["label", "cutoff"], pool, vocab, customers=keep))
++    df = pd.concat(frames, ignore_index=True)
++    del frames
++    for c in CAT_COLS:
++        if c in df.columns:
++            df[c] = pd.Categorical(df[c].astype(object), categories=vocab[c])
++    # parquetの行順は保証されない(write_feature_tableは並べ替えずに書き出す)ので、学習結果が再現するよう完全に並べる
++    df = df.sort_values(["cutoff", "customer_idx", "article_id"], kind="stable").reset_index(drop=True)
++    return df
++
++
++def group_sizes(df: pd.DataFrame) -> np.ndarray:
++    return df.groupby(["cutoff", "customer_idx"], sort=False, observed=True).size().to_numpy()
++
++
++def fit_ranker(train_df, feature_cols, eval_df=None, n_estimators=None, log_every=50):
++    params = dict(LGBM_PARAMS)
++    if n_estimators is not None:
++        params["n_estimators"] = int(n_estimators)
++    cat_cols = [c for c in CAT_COLS if c in feature_cols]
++    model = lgb.LGBMRanker(**params)
++    fit_kwargs = dict(group=group_sizes(train_df), categorical_feature=cat_cols)
++    callbacks = [lgb.log_evaluation(log_every)]
++    if eval_df is not None:
++        fit_kwargs.update(eval_set=[(eval_df[feature_cols], eval_df["label"])],
++                          eval_group=[group_sizes(eval_df)], eval_at=[12])
++        callbacks.append(lgb.early_stopping(EARLY_STOPPING_ROUNDS, verbose=True))
++    model.fit(train_df[feature_cols], train_df["label"], callbacks=callbacks, **fit_kwargs)
++    best_iter = model.best_iteration_ if eval_df is not None and model.best_iteration_ else params["n_estimators"]
++    return model, int(best_iter)
++
++
++def score_week(path: str, payload: dict, vocab: dict, batch_rows: int = 2_000_000) -> pd.DataFrame:
++    """1週分のテーブルを分割して読みながらスコアリングし、(customer_idx, article_id, score)を返す。"""
++    feature_cols = payload["feature_cols"]
++    dataset = ds.dataset(path, format="parquet")
++    cols = list(dict.fromkeys(KEY_COLS + feature_cols))
++    scanner = dataset.scanner(columns=cols, filter=_pool_filter(payload["pool"]), batch_size=batch_rows)
++    parts = []
++    model = payload["model"]
++    predict_kwargs = {"num_iteration": payload.get("best_iter")} if payload.get("best_iter") else {}
++    for batch in scanner.to_batches():
++        if batch.num_rows == 0:
++            continue
++        df = _to_pandas(pa.Table.from_batches([batch]), vocab)
++        parts.append(pd.DataFrame({
++            "customer_idx": df["customer_idx"].to_numpy(),
++            "article_id": df["article_id"].to_numpy(),
++            "score": model.predict(df[feature_cols], **predict_kwargs).astype(np.float32),
++        }))
++    return pd.concat(parts, ignore_index=True)
++
++
++def top_k_map(scored: pd.DataFrame, k: int = 12) -> dict:
++    # 同点スコアの並びを固定する(article_id昇順)。これが無いと行の読み込み順で結果が微妙に揺れる
++    top = scored.sort_values(["customer_idx", "score", "article_id"], ascending=[True, False, True], kind="stable")
++    top = top.groupby("customer_idx", sort=False).head(k)
++    return top.groupby("customer_idx", sort=False)["article_id"].apply(list).to_dict()
++
++
++def per_customer_ap(actual_map: dict, pred_map: dict, k: int = 12):
++    """actual_mapの全顧客(=その週に購入した全員。候補プール外の顧客は0点)について顧客別AP@kを返す。"""
++    customers = np.array(sorted(actual_map.keys()), dtype=np.int64)
++    ap = np.array([apk(actual_map[c], pred_map.get(c, []), k) for c in customers], dtype=np.float64)
++    return customers, ap
++
++
++def fallback_lists(con, cutoff: str):
++    """提出時と同じフォールバック用リスト: ({年齢層: 直近7日の同年齢層人気12件}, 直近7日の全体人気12件)。"""
++    from candidates import age_trend_lists, build_popularity_candidates, ensure_cust_age
++    ensure_cust_age(con)
++    return age_trend_lists(con, cutoff, k=12), build_popularity_candidates(con, cutoff, top_n=12)
++
++
++def fill_to_k(cands, age_list, global_top, k: int = 12) -> list:
++    """モデルの候補(最大k件)を、年齢層人気→全体人気の順で重複なくk件まで埋める。"""
++    out = list(cands[:k])
++    seen = set(out)
++    for a in list(age_list) + list(global_top):
++        if len(out) >= k:
++            break
++        if a not in seen:
++            out.append(a)
++            seen.add(a)
++    return out
++
++
++def submission_like_ap(actual_map: dict, model_pred_map: dict, active: set, buckets: dict,
++                       age_top: dict, global_top: list, cold_start: str, k: int = 12):
++    """提出ファイルと同じ作り方で予測を作ってから顧客別AP@kを出す。
++
++    - 直近56日にアクティブな顧客: モデルの上位k件(足りなければフォールバックで補充)
++    - それ以外(評価週に初めて/久しぶりに買った顧客): フォールバックのみ
++      (特徴量テーブルは学習用にこの顧客たちも含めて作っているが、提出時はモデルの対象外なので評価でも使わない)
++    cold_start: "global"(従来の06と同じ全体人気)/ "age_trend"(同年齢層の直近人気→全体人気)
++    """
++    customers = np.array(sorted(actual_map.keys()), dtype=np.int64)
++    ap = np.empty(len(customers), dtype=np.float64)
++    for i, c in enumerate(customers):
++        c = int(c)
++        age_list = age_top.get(buckets.get(c, -1), []) if cold_start == "age_trend" else []
++        model_list = model_pred_map.get(c, []) if c in active else []
++        ap[i] = apk(actual_map[c], fill_to_k(model_list, age_list, global_top, k), k)
++    return customers, ap
++
++
++def paired_bootstrap(diff: np.ndarray, n_boot: int = 2000, seed: int = 0) -> dict:
++    """顧客単位の差(新-旧)の平均について、顧客のリサンプリングで95%信頼区間を出す。"""
++    rng = np.random.default_rng(seed)
++    n = len(diff)
++    chunk = max(1, int(2e7 // max(n, 1)))  # 一度に作る添字配列を約2,000万要素(160MB)に抑える
++    means = []
++    for start in range(0, n_boot, chunk):
++        m = min(chunk, n_boot - start)
++        idx = rng.integers(0, n, size=(m, n))
++        means.append(diff[idx].mean(axis=1))
++    means = np.concatenate(means)
++    return {
++        "mean_diff": float(diff.mean()),
++        "ci_low": float(np.percentile(means, 2.5)),
++        "ci_high": float(np.percentile(means, 97.5)),
++        "p_improve": float((means > 0).mean()),
++    }
++
++
++def save_payload(path: str, **payload) -> None:
++    with open(path, "wb") as f:
++        pickle.dump(payload, f)
++
++
++def load_payload(path: str) -> dict:
++    with open(path, "rb") as f:
++        return pickle.load(f)
++
++
++def feature_importance(model, feature_cols) -> pd.DataFrame:
++    booster = model.booster_
++    return pd.DataFrame({
++        "feature": feature_cols,
++        "gain": booster.feature_importance(importance_type="gain"),
++        "split": booster.feature_importance(importance_type="split"),
++    }).sort_values("gain", ascending=False).reset_index(drop=True)
+-- 
+2.43.0
+
